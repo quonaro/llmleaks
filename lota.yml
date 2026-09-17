@@ -1,0 +1,38 @@
+vars:
+- PY=python
+
+scan:
+  desc: Search GitHub + verify + store keys
+  script: $PY cli.py scan
+
+verify:
+  desc: Verify keys from a file / checkpoint
+  args:
+  - "file:str?"
+  script: $PY cli.py verify $file
+
+monitor:
+  desc: Real-time GitHub PushEvent monitor
+  script: $PY cli.py monitor
+
+stats:
+  desc: Findings DB statistics
+  script: $PY cli.py stats
+
+report:
+  desc: Markdown research report from DB
+  script: $PY cli.py report
+
+push:
+  desc: Push to GitHub
+  color: cyan
+  args:
+  - "tag:str?"
+  script: |
+    if [ -n "$tag" ]; then
+      git tag -f $tag
+      git push origin main
+      git push origin $tag --force
+    else
+      git push origin main
+    fi
