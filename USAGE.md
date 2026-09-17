@@ -1,171 +1,183 @@
-# DeepSeek Key Hunter — Usage Guide
+# llmleaks — Usage Guide
 
 ## Setup
 
-### 1. Install Dependencies
-
 ```bash
-pip install aiohttp requests
-```
+pip install aiohttp requests   # Python 3.10+, no other dependencies
 
-Python 3.10+ required. No other dependencies.
-
-### 2. Authenticate (Optional but Recommended)
-
-Authenticated GitHub API access gives you 3x more search requests (30/min vs 10/min):
-
-```bash
-# Method A: GitHub CLI
+# GitHub auth (30 req/min vs 10 req/min unauthenticated):
 gh auth login
-
-# Method B: Environment variable
-export GITHUB_TOKEN="ghp_your_token_here"
-
-# Method C: GitLab (optional)
-export GITLAB_TOKEN="glpat-your-token"
-
-# Method D: Gitee (optional)
-export GITEE_TOKEN="your-gitee-token"
+# or: export GITHUB_TOKEN="ghp_..."  / extra pool tokens below
 ```
 
-### 3. Verify Setup
+## CLI
+
+Everything is one entry point now. The old `*_scan.py` scripts still work
+but are superseded by `scan --profile`.
+
+## Configuration
+
+All settings live in `config.yaml` (auto-loaded when it sits next to
+`cli.py`, or `--config path/to.yaml`). It's gitignored — tokens belong
+here, not in git.
+
+Precedence: **CLI flag > config.yaml > --profile preset > built-in
+defaults**. Every CLI flag has a config key; sections mirror the help
+groups:
+
+```yaml
+scan:       profile, sources, providers, queries_file, skip_builtin,
+            extra_queries, pages, workers, duration, max_keys, loop,
+            min_balance, exclude_repos, min/max_key_length
+network:    timeout, concurrency, search_delay, github_token(s),
+            gitlab_token, gitee_token, proxies, proxy_file,
+            vless, vless_file, vless_base_port, user_agent
+verification: with_balance, store_raw
+monitor:    poll_interval, verify
+output:     dir, db, no_db, usd_cny_rate, quiet
+```
+
+Every boolean flag accepts its negation (`--with-balance` /
+`--no-with-balance`, `--loop` / `--no-loop`, ...) so config values can be
+overridden in either direction from the CLI.
+
+```
+python cli.py scan       search + verify + store
+python cli.py verify     verify keys from a file
+python cli.py monitor    real-time GitHub PushEvent monitor
+python cli.py stats      findings DB statistics
+python cli.py report     markdown research report from DB
+python cli.py export     CSV/JSON export (hash + preview only)
+python cli.py providers  list providers & detection patterns
+python cli.py sources    list sources & profiles
+```
+
+## Scanning
 
 ```bash
-python -c "from scanner_engine import ScannerEngine; print('OK')"
+# Profiles = old scripts
+python cli.py scan --profile quick      # ~15 min   (was quick_batch.py)
+python cli.py scan --profile standard   # ~1 h      (was full_scan.py)
+python cli.py scan --profile max        # ~2 h      (was max_scan.py)
+python cli.py scan --profile deep       # ~3 h      (was deep_scan.py)
+python cli.py scan --profile expanded   # multi-source (was expanded_scan.py)
+python cli.py scan --profile ultimate   # everything  (was ultimate_scan.py)
+python cli.py scan --profile marathon   # cycles until Ctrl+C
+
+# Manual control (flags override profile values)
+python cli.py scan --sources github,gist,issues,gitlab
+python cli.py scan --sources all
+python cli.py scan --query "openai sk- filename:env" --skip-builtin
+python cli.py scan --queries-file queries_v4.txt --pages 5 -c 20
+python cli.py scan --providers deepseek,openai,anthropic
+python cli.py scan --duration 3600 --max-keys 100 --loop
 ```
 
-## Running Scans
+### Providers
 
-### Quick Start
+Detection is per-provider (prefix patterns + context disambiguation):
+`openai, anthropic, openrouter, deepseek, opencode, groq, xai,
+huggingface, replicate, perplexity, fireworks, cerebras, mistral,
+together, google`. Plain `sk-` keys are ranked by context and length,
+then probed against at most 3 provider endpoints.
+
+### Verification policy (built-in, not configurable)
+
+- one read-only GET per provider candidate, no retries on 401/403
+- identifying `User-Agent: llmleaks-research/...`
+- `--with-balance` (off by default) enables billing-endpoint probes
+- verification traffic never goes through proxies
+
+### Rate limits / tokens / proxies
 
 ```bash
-# Test run (15 minutes)
-python quick_batch.py
+python cli.py scan --github-tokens ghp_aaa,ghp_bbb        # token pool
+python cli.py scan --github-tokens-file tokens.txt
+python cli.py scan --proxy-file proxies.txt   # collection sources only
+python cli.py scan --proxy http://host:port   # repeatable
 
-# Standard scan (2 hours)
-python max_scan.py
+# VLESS rotation (requires sing-box in PATH)
+python cli.py scan --vless-file vless.txt
+python cli.py scan --vless "vless://uuid@host:443?security=reality&..."
+python cli.py scan --vless-file vless.txt --vless-base-port 21000
 
-# Deep scan (custom hours)
-python deep_scan.py --hours 3
+# Parallel batched search — one worker per VLESS exit
+python cli.py scan --vless-file vless.txt --workers 10
 ```
 
-### Comprehensive Coverage
+GitHub search is limited **per token**, so a token pool scales better than
+proxies. Proxies apply only to collection sources (Common Crawl, Wayback,
+etc.) — provider APIs are hard-excluded.
+
+VLESS links can't be used by HTTP clients directly — `--vless*` spawns a
+local `sing-box` with one `mixed` inbound (HTTP CONNECT + SOCKS5) per
+link on `127.0.0.1:<base_port+i>`, routed 1:1 to its VLESS outbound, and
+feeds those loopback proxies into the pool. The subprocess is killed on
+exit.
+
+### Parallel workers
+
+`--workers N` runs search in async batches: each batch fires N queries at
+once, worker *i* pinned to `proxies[i]` + `tokens[i]` (pool fallback when
+fewer resources than workers). Between batches: verify → incremental save
+→ delay, same as sequential mode. Default `0` = auto: `min(#proxies or
+#tokens, 8)`; without either it stays sequential.
+
+Pairing matters: one token reused from many IPs is a credential-sharing
+abuse pattern — give each worker its own GitHub token when possible.
+
+### Monitor mode
 
 ```bash
-# Full 5-phase scan (10-14 hours, no time limit)
-python ultimate_scan.py
-
-# Expanded multi-source (3-5 hours)
-python expanded_scan.py
+python cli.py monitor --verify --poll-interval 60
 ```
 
-### Using the CLI
+Watches GitHub PushEvents, extracts keys as they are pushed, optionally
+verifies them immediately — measures leak *incidence*, not just backlog.
+
+## Storage
+
+Everything lands in `results/findings.db` (SQLite):
+
+- `findings` — one row per unique key: **sha256 hash + preview only**,
+  provider, status, severity, balance, first/last seen
+- `occurrences` — where each key was seen (source/repo/file/url/query)
+- `scans` — run metadata
+
+Raw keys are **never** written to disk unless you pass `--store-raw`
+(needed only if you must hand keys to a provider disclosure program).
+Legacy `api_keys_result.json/csv/md` are still written to `output-dir`,
+but with `key_hash` instead of the raw key by default.
 
 ```bash
-# Single query search
-python deepseek_key_scanner.py --query "deepseek sk- filename:py"
-
-# Multi-source scan
-python deepseek_key_scanner.py --multi-source github gist issues
-
-# With custom tokens
-python deepseek_key_scanner.py --github-token "ghp_xxx" --gitlab-token "glpat-xxx"
+python cli.py stats
+python cli.py report --out report.md
+python cli.py export --format csv --status valid
+python cli.py export --format json > findings.json
 ```
 
-## Understanding Results
+## Verifying existing keys
 
-Results are saved in `results/`:
-- `deepseek_keys_result.json` — All verified keys with balances
-- `deepseek_keys_result.csv` — CSV format
-- `deepseek_keys_result.md` — Markdown report
-
-### Balance Fields
-
-| Field | Meaning |
-|-------|---------|
-| `balance` | Raw balance from API (original currency) |
-| `primary_currency` | USD or CNY |
-| `balance_usd` | Converted to USD equivalent |
-| `balance_cny` | Converted to CNY equivalent |
-| `balance_details` | Breakdown: granted vs tipped balance |
-| `valid` | `true` = valid API key |
-
-### Result Types
-
-- **Positive balance**: Active key with money — highest priority
-- **Zero balance**: Valid key but depleted
-- **Negative balance**: Overage/exhausted (欠费)
-- **Invalid**: Not a real API key (filtered out)
-
-## Query Patterns
-
-The built-in query library (`queries_v4.txt`) uses GitHub Code Search syntax:
-
-| Pattern | Example |
-|---------|---------|
-| File extension | `deepseek sk- filename:py` |
-| Language | `deepseek sk- language:Python` |
-| Path | `deepseek sk- path:config` |
-| Time filter | `deepseek sk- pushed:>2026-05-01` |
-| Variable name | `DEEPSEEK_API_KEY sk-` |
-| API pattern | `api.deepseek.com sk-` |
-
-## Adding Custom Queries
-
-Edit `queries_v4.txt` or pass queries directly:
-
-```python
-from scanner_engine import ScannerEngine
-
-custom_queries = [
-    "my-org deepseek sk- filename:env",
-    "deepseek sk- path:deploy",
-]
-engine = ScannerEngine(max_duration=1800, scan_pages=3)
-results = engine.run(custom_queries)
+```bash
+python cli.py verify keys.txt                        # one key per line
+python cli.py verify results/api_keys_result.json    # engine output
+python cli.py verify keys.txt --with-balance -c 20
 ```
 
-## Selecting Scan Sources
+Statuses: `valid`, `revoked`, `no_quota` (works but out of credit),
+`rate_limited`, `unverifiable`, `timeout`, `error`.
 
-For multi-source mode, specify which scanners to use:
+## Legacy scripts
 
-```python
-engine = ScannerEngine(concurrency=15)
+`quick_batch.py`, `max_scan.py`, `deep_scan.py`, `ultimate_scan.py`,
+`expanded_scan.py`, `marathon_scan.py`, `six_hour_scan.py`,
+`full_scan.py`, `deepseek_key_scanner.py`, `api_key_hunter.py`
+remain for compatibility — prefer `cli.py`.
 
-# Available sources:
-# github, gist, issues, commits, gitlab, gitee,
-# huggingface, pypi, npm, stackoverflow,
-# docker, wayback, commoncrawl
+## Security notes
 
-results = engine.run_multi_source([
-    "huggingface",
-    "pypi",
-    "gist",
-    "issues",
-])
-```
-
-## Tips for Better Results
-
-1. **Use time filters**: `pushed:>2026-05-01` finds recent leaks before they're noticed
-2. **Target config files**: `.env`, `application.yml`, `credentials` have highest hit rate
-3. **Scan commit history**: Deleted keys in git history are often overlooked
-4. **Check alternative platforms**: HuggingFace, PyPI, npm — less scanned than GitHub
-5. **Run cyclically**: Use `marathon_scan.py` or cron to catch new leaks continuously
-
-## Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| "Rate limit" errors | Add GitHub auth token, reduce `concurrency` |
-| No results | Check internet connection, verify queries |
-| "Module not found" | `pip install aiohttp requests` |
-| Encoding errors (Windows) | Set terminal to UTF-8 or use WSL |
-| Scan too slow | Authenticate GitHub, reduce `search_delay`, increase `concurrency` |
-
-## Security Notes
-
-- Results contain actual API keys — treat `results/` as sensitive
-- Use `.gitignore` to exclude result files from version control
-- Never commit `deepseek_keys_result.json` to a public repository
-- Rotate any discovered keys if you are the owner
+- `results/` is sensitive even with hash-only storage — keep it private
+  and gitignored.
+- Validation is deliberately minimal-touch. Do not raise it.
+- Found keys belong to someone else: report to the provider first
+  (bulk revocation beats emailing owners), never use them.

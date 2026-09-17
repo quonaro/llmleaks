@@ -1,6 +1,6 @@
 """
-API Key Hunter - 多提供商扫描引擎核心模块
-支持 DeepSeek / OpenAI / OpenRouter + CLI / GUI
+API Key Hunter - multi-provider scan engine core module
+Supports DeepSeek / OpenAI / OpenRouter + CLI / GUI
 """
 
 import asyncio
@@ -20,6 +20,10 @@ from typing import Callable, Optional
 
 # Scanner imports for multi-source mode
 from scanners.base import extract_keys as scanner_extract_keys, is_bad_key as _scanner_is_bad_key
+from detectors import Detector, PROVIDERS as _PROVIDER_SPECS
+from verifiers import verify_key as _verify_key_external, RESEARCH_UA
+from ratelimit import TokenPool, ProxyPool
+from store import Store, key_hash as _key_hash
 from scanners.github_gist import GistScanner
 from scanners.github_issues import IssuesScanner
 from scanners.github_events import EventsMonitor
@@ -38,8 +42,11 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-# 默认汇率（1 USD = ? CNY）
+# Default exchange rate (1 USD = ? CNY)
 DEFAULT_USD_CNY_RATE = 7.25
+
+# sentinel: "use the proxy pool" vs an explicit proxy/None override
+_AUTO = object()
 
 KEY_PATTERN = re.compile(r"sk-[a-zA-Z0-9]{32,100}")
 
@@ -139,28 +146,28 @@ def _parse_openrouter_credits(data: dict) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  终极查询库 (按热度排序 — 高产出 → 低产出)
-#  基于: 实测数据 + GitGuardian 2025 + TruffleHog + GH Dorking 研究
+#  Ultimate query library (sorted by yield — high → low)
+#  Based on: field-test data + GitGuardian 2025 + TruffleHog + GH Dorking research
 # ═══════════════════════════════════════════════════════════════════
 
 BUILTIN_QUERIES = [
     # ═══════════════════════════════════════════════════════
-    #  🔥 第一梯队 — 实测最高产出 (Java/Kotlin/PHP/Python)
+    #  🔥 Tier 1 — highest yield in field tests (Java/Kotlin/PHP/Python)
     # ═══════════════════════════════════════════════════════
 
-    # Java (Spring Boot / Android — 实测 90+ keys)
+    # Java (Spring Boot / Android — 90+ keys in field tests)
     "deepseek sk- filename:java",
     "deepseek sk- filename:properties",
     "deepseek sk- filename:gradle",
 
-    # Kotlin (Android — 实测 22 keys)
+    # Kotlin (Android — 22 keys in field tests)
     "deepseek sk- filename:kt",
 
-    # PHP (Web后端 — 实测 26 keys)
+    # PHP (web backend — 26 keys in field tests)
     "deepseek sk- filename:php",
     "api.deepseek.com sk- filename:php",
 
-    # Python (AI/ML 代码硬编码)
+    # Python (hardcoded AI/ML code)
     "deepseek sk- language:Python NOT env NOT export",
     "deepseek sk- filename:py NOT env",
     "deepseek OpenAI(api_key sk- filename:py",
@@ -170,7 +177,7 @@ BUILTIN_QUERIES = [
     "api.deepseek.com sk- filename:py",
 
     # ═══════════════════════════════════════════════════════
-    #  🔥 第二梯队 — 配置文件泄露 (.env / config)
+    #  🔥 Tier 2 — config file leaks (.env / config)
     # ═══════════════════════════════════════════════════════
 
     "deepseek sk- filename:env",
@@ -183,7 +190,7 @@ BUILTIN_QUERIES = [
     "deepseek sk- filename:credentials",
     "deepseek sk- filename:secrets",
 
-    # 配置文件
+    # Config files
     "deepseek sk- filename:yml",
     "deepseek sk- filename:yaml",
     "deepseek sk- filename:json",
@@ -194,7 +201,7 @@ BUILTIN_QUERIES = [
     "deepseek sk- filename:config",
 
     # ═══════════════════════════════════════════════════════
-    #  🔥 第三梯队 — 移动端 (Dart/Swift) + Shell 脚本
+    #  🔥 Tier 3 — mobile (Dart/Swift) + Shell scripts
     # ═══════════════════════════════════════════════════════
 
     "deepseek sk- filename:dart",
@@ -208,7 +215,7 @@ BUILTIN_QUERIES = [
     "deepseek sk- filename:fish",
 
     # ═══════════════════════════════════════════════════════
-    #  🔥 第四梯队 — JS/TS + C++ + Go + C#
+    #  🔥 Tier 4 — JS/TS + C++ + Go + C#
     # ═══════════════════════════════════════════════════════
 
     "deepseek sk- filename:js",
@@ -222,7 +229,7 @@ BUILTIN_QUERIES = [
     "deepseek sk- filename:cs",
 
     # ═══════════════════════════════════════════════════════
-    #  🔥 第五梯队 — Jupyter / Docker / Lua / 变量名
+    #  🔥 Tier 5 — Jupyter / Docker / Lua / variable names
     # ═══════════════════════════════════════════════════════
 
     "deepseek sk- filename:ipynb",
@@ -234,7 +241,7 @@ BUILTIN_QUERIES = [
 
     "deepseek sk- filename:lua path:nvim",
 
-    # 变量名变体
+    # Variable name variants
     "DEEPSEEK_API_KEY sk-",
     "DEEPSEEK_KEY sk-",
     "deepseek_api_key sk-",
@@ -243,7 +250,7 @@ BUILTIN_QUERIES = [
     "DEEPSEEK_API_TOKEN sk-",
 
     # ═══════════════════════════════════════════════════════
-    #  第六梯队 — API 客户端模式 + 文本文件
+    #  Tier 6 — API client patterns + text files
     # ═══════════════════════════════════════════════════════
 
     "api.deepseek.com OpenAI sk-",
@@ -255,7 +262,7 @@ BUILTIN_QUERIES = [
     "deepseek sk- filename:md",
 
     # ═══════════════════════════════════════════════════════
-    #  第七梯队 — 跨文件类型 + 时间限定
+    #  Tier 7 — cross file types + time filters
     # ═══════════════════════════════════════════════════════
 
     "deepseek process.env sk- filename:js",
@@ -264,7 +271,7 @@ BUILTIN_QUERIES = [
     "deepseek sk- filename:html",
 
     # ═══════════════════════════════════════════════════════
-    #  第八梯队 — 小众语言但偶尔有产出
+    #  Tier 8 — niche languages, occasional hits
     # ═══════════════════════════════════════════════════════
 
     "deepseek sk- filename:rb",
@@ -273,7 +280,7 @@ BUILTIN_QUERIES = [
     "deepseek sk- filename:plist",
 
     # ═══════════════════════════════════════════════════════
-    #  第九梯队 — 时间限定 + 2026 新模式 (v5 实测高产)
+    #  Tier 9 — time filters + 2026 patterns (high yield in v5 tests)
     # ═══════════════════════════════════════════════════════
 
     "deepseek sk- pushed:>2026-05-01",
@@ -304,7 +311,7 @@ BUILTIN_QUERIES = [
     "deepseek process.env.DEEPSEEK sk- filename:ts",
 
     # ═══════════════════════════════════════════════════════
-    #  第十梯队 — 替代平台 + 框架集成 (OpenRouter/LangChain/等)
+    #  Tier 10 — alternative platforms + framework integrations (OpenRouter/LangChain/etc)
     # ═══════════════════════════════════════════════════════
 
     # OpenRouter proxy (people proxy DeepSeek through OpenRouter)
@@ -357,7 +364,7 @@ BUILTIN_QUERIES = [
     "deepseek ds-",
 
     # ═══════════════════════════════════════════════════════
-    #  第十一梯队 — 更多框架/平台/部署场景
+    #  Tier 11 — more frameworks/platforms/deployment scenarios
     # ═══════════════════════════════════════════════════════
 
     # FastGPT / ChatGPT-Next-Web / LobeChat / OneAPI
@@ -431,7 +438,7 @@ BUILTIN_QUERIES = [
     "deepseek sk- filename:proto",
 
     # ═══════════════════════════════════════════════════════
-    #  第十二梯队 — 深度时间过滤 (2026年最新)
+    #  Tier 12 — deep time filters (latest 2026)
     # ═══════════════════════════════════════════════════════
 
     "deepseek sk- pushed:>2026-05-15",
@@ -452,7 +459,7 @@ BUILTIN_QUERIES = [
     "deepseek sk- filename:dart pushed:>2026-05-01",
 
     # ═══════════════════════════════════════════════════════
-    #  第十三梯队 — 变量名变体 + 拼接模式
+    #  Tier 13 — variable name variants + concatenation patterns
     # ═══════════════════════════════════════════════════════
 
     "deepseek_api_key = sk-",
@@ -474,7 +481,7 @@ BUILTIN_QUERIES = [
     "pydantic deepseek sk-",
 
     # ═══════════════════════════════════════════════════════
-    #  第十四梯队 — API 调用模式
+    #  Tier 14 — API call patterns
     # ═══════════════════════════════════════════════════════
 
     "deepseek.chat.completions sk-",
@@ -492,7 +499,7 @@ BUILTIN_QUERIES = [
     "deepseek-api-key sk-",
 
     # ═══════════════════════════════════════════════════════
-    #  第十五梯队 — 小众但偶尔有产出
+    #  Tier 15 — niche but occasionally productive
     # ═══════════════════════════════════════════════════════
 
     "deepseek sk- filename:sql",
@@ -534,10 +541,10 @@ BUILTIN_QUERIES = [
     "deepseek sk- path:cdk",
 
     # ═══════════════════════════════════════════════════════
-    #  第十六梯队 — 通用 sk- 查询 (无 deepseek 关键词, 覆盖 OpenAI/OpenRouter)
+    #  Tier 16 — generic sk- queries (no deepseek keyword, covers OpenAI/OpenRouter)
     # ═══════════════════════════════════════════════════════
 
-    # 纯 sk- 密钥搜索 (不限提供商)
+    # Pure sk- key search (provider-agnostic)
     "sk- filename:env NOT deepseek",
     "sk- filename:env.local NOT deepseek",
     "sk- filename:env.production NOT deepseek",
@@ -548,7 +555,7 @@ BUILTIN_QUERIES = [
     "sk- filename:credentials NOT deepseek",
     "sk- filename:secrets NOT deepseek",
 
-    # API Key 变量名模式 (OpenAI/OpenRouter)
+    # API key variable name patterns (OpenAI/OpenRouter)
     "OPENAI_API_KEY sk-",
     "OPENROUTER_API_KEY sk-",
     "OPENAI_KEY sk-",
@@ -561,7 +568,7 @@ BUILTIN_QUERIES = [
     "openai_api_key sk- filename:env",
     "openrouter_api_key sk- filename:env",
 
-    # 通用 API 客户端模式
+    # Generic API client patterns
     "api.openai.com sk- filename:py NOT deepseek",
     "api.openai.com sk- filename:js NOT deepseek",
     "openrouter.ai sk- filename:py",
@@ -572,7 +579,7 @@ BUILTIN_QUERIES = [
     "Authorization Bearer sk- filename:js NOT deepseek",
     "Authorization Bearer sk- filename:env NOT deepseek",
 
-    # 通用配置文件
+    # Generic config files
     "sk- filename:yml NOT deepseek",
     "sk- filename:yaml NOT deepseek",
     "sk- filename:json NOT deepseek",
@@ -581,7 +588,7 @@ BUILTIN_QUERIES = [
     "sk- filename:conf NOT deepseek",
     "sk- filename:config NOT deepseek",
 
-    # 通用 Code 文件 (无 deepseek 关键词)
+    # Generic code files (no deepseek keyword)
     "sk- filename:py NOT deepseek NOT env",
     "sk- filename:js NOT deepseek NOT env",
     "sk- filename:ts NOT deepseek",
@@ -596,12 +603,12 @@ BUILTIN_QUERIES = [
     "sk- filename:swift NOT deepseek",
     "sk- filename:dart NOT deepseek",
 
-    # LangChain / 框架集成 (无 deepseek)
+    # LangChain / framework integrations (no deepseek)
     "langchain openai_api_key",
     "langchain openrouter_api_key",
     "litellm api_key sk-",
 
-    # CI/CD 密钥泄露
+    # CI/CD secret leaks
     "OPENAI_API_KEY path:.github/workflows",
     "OPENROUTER_API_KEY path:.github/workflows",
     "API_KEY sk- path:.github/workflows NOT deepseek",
@@ -611,7 +618,7 @@ BUILTIN_QUERIES = [
     "sk- filename:docker-compose NOT deepseek",
     "sk- path:k8s NOT deepseek",
 
-    # 时间限定 (2026 最新)
+    # Time filters (latest 2026)
     "sk- pushed:>2026-05-01 NOT deepseek",
     "sk- pushed:>2026-04-01 NOT deepseek",
     "sk- filename:env pushed:>2026-04-01 NOT deepseek",
@@ -621,34 +628,34 @@ BUILTIN_QUERIES = [
     "sk- filename:json pushed:>2026-04-01 NOT deepseek",
     "sk- filename:java pushed:>2026-04-01 NOT deepseek",
 
-    # process.env 模式
+    # process.env patterns
     "process.env.OPENAI_API_KEY sk-",
     "process.env.OPENROUTER_API_KEY sk-",
     "process.env sk- filename:js NOT deepseek",
     "os.environ sk- filename:py NOT deepseek",
     "os.getenv sk- filename:py NOT deepseek",
 
-    # AI 框架 config (无需 deepseek)
+    # AI framework config (no deepseek needed)
     "sk- path:config NOT deepseek",
     "sk- path:src/main/resources NOT deepseek",
     "sk- filename:application.yml NOT deepseek",
     "sk- filename:application.properties NOT deepseek",
 
-    # OpenRouter 特定模式
+    # OpenRouter-specific patterns
     "openrouter sk- filename:py",
     "openrouter sk- filename:js",
     "openrouter sk- filename:ts",
     "openrouter API_KEY sk-",
     "openrouter api_key sk- filename:env",
 
-    # OpenAI 特定模式
+    # OpenAI-specific patterns
     "openai sk- filename:py NOT deepseek",
     "openai sk- filename:js NOT deepseek",
     "openai sk- filename:env NOT deepseek",
     "openai.Client sk- filename:py",
     "openai.OpenAI sk- filename:py",
 
-    # 通用 LLM 平台 (LobeChat / Dify / vLLM)
+    # Generic LLM platforms (LobeChat / Dify / vLLM)
     "lobechat OPENAI_API_KEY",
     "dify OPENAI_API_KEY",
     "fastgpt OPENAI_API_KEY",
@@ -657,7 +664,7 @@ BUILTIN_QUERIES = [
     "open-webui OPENAI_API_KEY",
     "vllm api_key sk-",
 
-    # 通用 key 文件
+    # Generic key files
     "sk- filename:txt NOT deepseek",
     "sk- filename:md NOT deepseek",
     "sk- filename:html NOT deepseek",
@@ -666,7 +673,7 @@ BUILTIN_QUERIES = [
     "sk- filename:bash NOT deepseek",
 
     # ═══════════════════════════════════════════════════════
-    #  第十七梯队 — OpenCode Zen (opencode.ai)
+    #  Tier 17 — OpenCode Zen (opencode.ai)
     # ═══════════════════════════════════════════════════════
 
     # OpenCode Zen API key patterns
@@ -743,6 +750,13 @@ class ScannerEngine:
                  max_valid_keys: int = 0,
                  auto_save_interval: int = 0,
                  scan_pages: int = 5,
+                 github_tokens: list = None,
+                 proxies: list = None,
+                 search_workers: int = 0,
+                 check_balance: bool = True,
+                 db_path: str = None,
+                 store_raw_keys: bool = True,
+                 user_agent: str = None,
                  ):
         self.concurrency = concurrency
         self.timeout = timeout
@@ -765,15 +779,35 @@ class ScannerEngine:
         self.log_callback = log_callback or (lambda msg, level="info": print(msg))
         self.progress_callback = progress_callback or (lambda cur, total, phase: None)
 
-        # 退出机制
+        # Exit conditions
         self.max_duration = max_duration
         self.max_valid_keys = max_valid_keys
         self.auto_save_interval = auto_save_interval or 20
-        self.scan_pages = max(1, min(10, scan_pages or 10))  # 默认10页, 限1-10
+        self.scan_pages = max(1, min(10, scan_pages or 10))  # default 10 pages, clamped to 1-10
 
         self.key_pattern = re.compile(
             rf"sk-[a-zA-Z0-9]{{{min_key_length},{max_key_length}}}"
         )
+
+        # ---- research-hardening additions ----
+        self.check_balance = check_balance          # billing endpoints only if True
+        self.store_raw_keys = store_raw_keys        # False → hash+preview on disk
+        self.user_agent = user_agent or RESEARCH_UA
+        self._detector = Detector(providers=self.providers)
+
+        gh_tokens = list(github_tokens or [])
+        env_tok = self.get_gh_token()
+        if env_tok and env_tok not in gh_tokens:
+            gh_tokens.append(env_tok)
+        self._gh_tokens = gh_tokens
+        self._token_pool = TokenPool(gh_tokens)
+        self._proxy_pool = ProxyPool(proxies or [])
+        # parallel search workers: 0/1 = sequential; >1 = one worker per
+        # proxy/token pair, queries processed in async batches
+        self.search_workers = search_workers
+        self._store = Store(db_path) if db_path else None
+        self._scan_id = 0
+
         self._stop_requested = False
         self._start_time = time.time()
         self._valid_count = 0
@@ -785,7 +819,7 @@ class ScannerEngine:
 
     @staticmethod
     def check_gh_auth() -> bool:
-        """检测 gh CLI 是否已认证"""
+        """Check whether the gh CLI is authenticated"""
         return bool(ScannerEngine.get_gh_token())
 
     @staticmethod
@@ -810,7 +844,7 @@ class ScannerEngine:
 
     @staticmethod
     def suggested_search_delay() -> float:
-        """根据认证状态建议安全请求间隔"""
+        """Suggest a safe request interval based on auth state"""
         return 2.5 if ScannerEngine.check_gh_auth() else 6.5
 
     def log(self, msg: str, level: str = "info"):
@@ -820,23 +854,35 @@ class ScannerEngine:
         self._stop_requested = True
 
     # ================================================================
-    #  主流水线: 搜索 → 验证 → 保存 → 检查退出 → 下一轮
-    #  每轮 = 一条查询, 边扫边验边存, 时间/数量达标立即退出
+    #  Main pipeline: search → verify → save → check exit → next round
+    #  Each round = one query; scan/verify/save as it goes; exits as soon
+    #  as the time/count target is hit
     # ================================================================
 
-    # Provider keywords for query filtering
+    # Provider keywords for query filtering (superset — driven by detectors)
     _PROVIDER_KW = {
         "deepseek": ["deepseek", "api.deepseek.com", "ds_api_key", "ds_key",
                      "DEEPSEEK_API_KEY", "DEEPSEEK_KEY", "DEEPSEEK_TOKEN", "DEEPSEEK_API_TOKEN"],
         "openai": ["openai", "api.openai.com", "OPENAI_API_KEY", "OPENAI_KEY", "OPENAI_TOKEN"],
         "openrouter": ["openrouter", "openrouter.ai", "OPENROUTER_API_KEY", "OPENROUTER_KEY"],
         "opencode": ["opencode", "opencode.ai", "OPENCODE_API_KEY", "OPENCODE_KEY", "opencode zen"],
+        "anthropic": ["anthropic", "claude", "api.anthropic.com", "ANTHROPIC_API_KEY", "sk-ant-"],
+        "groq": ["groq", "api.groq.com", "GROQ_API_KEY", "gsk_"],
+        "xai": ["xai", "api.x.ai", "grok", "XAI_API_KEY"],
+        "huggingface": ["huggingface", "hf.co", "HF_TOKEN", "HUGGINGFACE", "hf_"],
+        "replicate": ["replicate", "REPLICATE_API_TOKEN", "r8_"],
+        "perplexity": ["perplexity", "pplx-", "PERPLEXITY_API_KEY"],
+        "fireworks": ["fireworks", "fireworks.ai", "FIREWORKS_API_KEY", "fw_"],
+        "cerebras": ["cerebras", "CEREBRAS_API_KEY", "csk-"],
+        "mistral": ["mistral", "api.mistral.ai", "MISTRAL_API_KEY"],
+        "together": ["together", "api.together.xyz", "TOGETHER_API_KEY"],
+        "google": ["generativelanguage", "gemini", "GOOGLE_API_KEY", "makersuite", "AIza"],
     }
 
     def _filter_queries_for_providers(self, queries: list) -> list:
         """Filter search queries to only those relevant to active providers.
         Generic sk- queries (no provider keyword, or only in NOT clauses) are always kept."""
-        if set(self.providers) >= {"deepseek", "openai", "openrouter", "opencode"}:
+        if set(self.providers) >= set(self._PROVIDER_KW):
             return list(queries)  # all providers → no filtering
 
         import re
@@ -858,86 +904,103 @@ class ScannerEngine:
         return filtered
 
     def run(self, queries: list) -> list:
-        """主流水线: 逐条查询, 搜索→验证→保存→检查限制→循环
-        支持 Ctrl+C 优雅退出: 保存进度, 验证已扫 Key, 保存结果
+        """Main pipeline: query by query, search→verify→save→check limits→loop
+        Supports graceful Ctrl+C exit: saves progress, verifies scanned keys, saves results
         """
         if not queries:
             return []
 
-        all_valid = []      # 最终有效结果
+        all_valid = []      # final valid results
         total_scanned = 0
         current_round = 0
-        unverified_keys = {}  # 当前轮未验证的 Key (Ctrl+C 时补验)
+        unverified_keys = {}  # keys from the current round not yet verified (verified on Ctrl+C)
         os.makedirs(self.output_dir, exist_ok=True)
         self._start_time = time.time()
+        if self._store and not self._scan_id:
+            self._scan_id = self._store.start_scan(["github"], self.providers)
 
         # Filter queries by active providers, then sort by heat
         ordered = self._filter_queries_for_providers(queries)
         skipped = len(queries) - len(ordered)
 
-        self.log(f"流水线启动: {len(queries)} 条查询 → 过滤后 {len(ordered)} 条 (跳过 {skipped} 条不相关), "
-                 f"并发 {self.concurrency}, 时长限制 {self.max_duration}s, 目标 {self.max_valid_keys} 个有效Key")
+        # work units: single queries (sequential) or batches of
+        # search_workers queries run in parallel, one proxy/token each
+        if self.search_workers > 1:
+            units = [ordered[i:i + self.search_workers]
+                     for i in range(0, len(ordered), self.search_workers)]
+            self.log(f"Parallel mode: {self.search_workers} workers, "
+                     f"{len(units)} batches")
+        else:
+            units = [[q] for q in ordered]
+
+        self.log(f"Pipeline start: {len(queries)} queries → {len(ordered)} after filtering (skipped {skipped} unrelated), "
+                 f"concurrency {self.concurrency}, duration limit {self.max_duration}s, target {self.max_valid_keys} valid keys")
 
         try:
-            for qi, query in enumerate(ordered):
+            for qi, unit in enumerate(units):
                 current_round = qi + 1
 
-                # ── 检查退出条件 ──
+                # ── Check exit conditions ──
                 if self._should_stop():
-                    self.log(f"流水线退出: {self._stop_reason()}", "warning")
+                    self.log(f"Pipeline exit: {self._stop_reason()}", "warning")
                     break
 
                 self.log(f"\n{'='*40}")
-                self.log(f"轮次 [{qi+1}/{len(queries)}]: {query}")
-                self.progress_callback(qi + 1, len(queries), "search")
+                label = unit[0] if len(unit) == 1 else \
+                    f"batch of {len(unit)}: {unit[0]} ..."
+                self.log(f"Round [{qi+1}/{len(units)}]: {label}")
+                self.progress_callback(qi + 1, len(units), "search")
 
-                # ── 第一步: 搜索 ──
-                round_keys = self._scan_one_query(query)
-                unverified_keys = round_keys  # 暂存，用于 Ctrl+C 恢复
+                # ── Step 1: search ──
+                if self.search_workers > 1:
+                    round_keys = asyncio.run(self._scan_queries_parallel(unit))
+                else:
+                    round_keys = self._scan_one_query(unit[0])
+                unverified_keys = round_keys  # stash for Ctrl+C recovery
                 if not round_keys:
-                    self.log(f"  本轮发现: 0 个 Key，跳过验证")
+                    self.log(f"  Found this round: 0 keys, skipping verification")
                     unverified_keys = {}
                     time.sleep(self.search_delay)
                     continue
 
-                self.log(f"  本轮发现: {len(round_keys)} 个疑似 Key")
+                self.log(f"  Found this round: {len(round_keys)} candidate keys")
 
-                # ── 第二步: 立即验证 ──
-                self.log(f"  开始验证 {len(round_keys)} 个 Key...")
+                # ── Step 2: verify immediately ──
+                self.log(f"  Verifying {len(round_keys)} keys...")
                 round_results = self._verify_dict(round_keys)
-                unverified_keys = {}  # 已验证，清空暂存
+                unverified_keys = {}  # verified; clear stash
 
                 valid = [r for r in round_results if r.get("valid")]
                 invalid = [r for r in round_results if not r.get("valid")]
-                self.log(f"  验证结果: {len(valid)} 有效, {len(invalid)} 无效 (丢弃)")
+                self.log(f"  Verification: {len(valid)} valid, {len(invalid)} invalid (dropped)")
 
-                # 有效 Key 加入累计 (去重)
+                # Add valid keys to the total (dedup)
                 existing_keys = {r["key"] for r in all_valid}
                 for r in valid:
                     if r["key"] not in existing_keys:
                         all_valid.append(r)
                         existing_keys.add(r["key"])
-                # 统计所有有效 Key (原始逻辑: 多多益善)
+                # Count all valid keys (original logic: the more the better)
                 self._valid_count = len(all_valid)
                 total_scanned += len(round_keys)
 
-                # ── 第三步: 增量保存 (仅有效 Key) ──
-                self._save_incremental(all_valid, qi, len(queries))
+                # ── Step 3: incremental save (valid keys only) ──
+                self._save_incremental(all_valid, qi, len(units))
 
-                # ── 第四步: 检查退出条件 ──
+                # ── Step 4: check exit conditions ──
                 if self._should_stop():
-                    self.log(f"  轮次结束后 {self._stop_reason()}", "warning")
+                    self.log(f"  After round: {self._stop_reason()}", "warning")
                     break
 
                 time.sleep(self.search_delay)
 
         except KeyboardInterrupt:
-            self.log(f"\n!!! 收到 Ctrl+C 信号 !!!", "error")
-            self.log(f"已扫描 {current_round-1}/{len(queries)} 轮, {len(all_valid)} 个有效Key")
+            self.log(f"\n!!! Ctrl+C signal received !!!", "error")
+            self.log(f"Scanned {current_round-1}/{len(queries)} rounds, {len(all_valid)} valid keys")
 
-            # 验证未完成的轮次的 Key
+            # Verify keys from the unfinished round
             if unverified_keys:
-                self.log(f"正在验证当前轮 {len(unverified_keys)} 个未验证 Key...")
+                self.log(f"Verifying {len(unverified_keys)} unverified keys from the current round...")
                 try:
                     emergency_results = self._verify_dict(unverified_keys)
                     valid_emergency = [r for r in emergency_results if r.get("valid")]
@@ -948,43 +1011,49 @@ class ScannerEngine:
                             all_valid.append(r)
                             existing.add(r["key"])
                             added += 1
-                    self.log(f"紧急验证完成: {len(valid_emergency)} 有效, 新增 {added} 个")
+                    self.log(f"Emergency verification done: {len(valid_emergency)} valid, {added} new")
                 except Exception as e:
-                    self.log(f"紧急验证失败: {e}", "error")
+                    self.log(f"Emergency verification failed: {e}", "error")
 
-            # 保存进度
+            # Save progress
             self._save_final(all_valid)
-            self.log(f"已安全保存 {len(all_valid)} 个有效Key, 优雅退出", "warning")
+            self.log(f"Safely saved {len(all_valid)} valid keys, exiting gracefully", "warning")
 
-        # 最终保存
+        # Final save
         self._save_final(all_valid)
         elapsed = time.time() - self._start_time
 
         positive_only = [r for r in all_valid if r.get("balance_usd", 0) > 0]
         self.log(f"\n{'='*40}")
-        self.log(f"流水线完成: {elapsed:.0f}s | 扫描 {total_scanned} 个Key | "
-                 f"有效 {len(all_valid)} 个 | 正余额 {len(positive_only)} 个")
+        self.log(f"Pipeline done: {elapsed:.0f}s | scanned {total_scanned} keys | "
+                 f"valid {len(all_valid)} | positive balance {len(positive_only)}")
         if positive_only:
             total_usd = sum(r.get("balance_usd", 0) for r in positive_only)
             total_cny = sum(r.get("balance_cny", 0) for r in positive_only)
-            self.log(f"正余额总价值: ${total_usd:.2f} / ¥{total_cny:.2f} (欠费不计入)")
+            self.log(f"Total positive balance: ${total_usd:.2f} / ¥{total_cny:.2f} (overdue not counted)")
 
+        if self._store and self._scan_id:
+            self._store.end_scan(self._scan_id, queries=len(ordered),
+                                 candidates=total_scanned, valid=len(all_valid))
+            self._scan_id = 0
         return all_valid
 
     def run_multi_source(self, sources: list, queries: list = None,
                          github_token: str = "", gitlab_token: str = "",
                          gitee_token: str = "") -> list:
-        """多源扫描: 同时扫描 GitHub + Gist + Issues + GitLab + Gitee + Docker + ...
+        """Multi-source scan: scan GitHub + Gist + Issues + GitLab + Gitee + Docker + ... at once
         sources: ['github', 'gist', 'issues', 'gitlab', 'wayback', 'docker',
                    'commoncrawl', 'gitee', 'npm']
-        每个 source 用独立 scanner 实例，并发运行。
+        Each source runs in its own scanner instance, concurrently.
         """
         if not sources:
-            self.log("未指定扫描来源", "warning")
+            self.log("No scan sources specified", "warning")
             return []
 
         os.makedirs(self.output_dir, exist_ok=True)
         self._start_time = time.time()
+        if self._store and not self._scan_id:
+            self._scan_id = self._store.start_scan(list(sources), self.providers)
 
         scanner_map = {
             "github": ("GitHub Code Search", self._filter_queries_for_providers(queries or BUILTIN_QUERIES)),
@@ -995,15 +1064,15 @@ class ScannerEngine:
             "wayback": ("Wayback Machine", None),
             "docker": ("Docker Hub", None),
             "commoncrawl": ("Common Crawl", None),
-            "gitee": ("Gitee 码云", None),
+            "gitee": ("Gitee", None),
             "npm": ("npm Registry", None),
             "huggingface": ("HuggingFace", None),
             "pypi": ("PyPI Registry", None),
             "stackoverflow": ("Stack Overflow", None),
         }
 
-        self.log(f"多源扫描启动: {len(sources)} 个来源 -> {[scanner_map[s][0] for s in sources]}")
-        self.log(f"验证并发: {self.concurrency}, 时长限制: {self.max_duration}s, 目标: {self.max_valid_keys} 个")
+        self.log(f"Multi-source scan start: {len(sources)} sources -> {[scanner_map[s][0] for s in sources]}")
+        self.log(f"Verify concurrency: {self.concurrency}, duration limit: {self.max_duration}s, target: {self.max_valid_keys}")
 
         all_discovered = {}
 
@@ -1013,29 +1082,29 @@ class ScannerEngine:
 
             label, default_query = scanner_map.get(src, (src, None))
             self.log(f"\n{'='*50}")
-            self.log(f"  [{label}] 开始扫描...")
+            self.log(f"  [{label}] scanning...")
             self.log(f"{'='*50}")
 
             try:
                 round_keys = self._run_one_scanner(src, default_query, github_token,
                                                    gitlab_token, gitee_token)
             except Exception as e:
-                self.log(f"  [{label}] 扫描异常: {e}", "error")
+                self.log(f"  [{label}] scan error: {e}", "error")
                 continue
 
             if not round_keys:
-                self.log(f"  [{label}] 未发现 Key")
+                self.log(f"  [{label}] no keys found")
                 continue
 
-            self.log(f"  [{label}] 发现 {len(round_keys)} 个疑似 Key")
+            self.log(f"  [{label}] found {len(round_keys)} candidate keys")
 
             # Verify
-            self.log(f"  验证 {len(round_keys)} 个 Key...")
+            self.log(f"  Verifying {len(round_keys)} keys...")
             round_results = self._verify_dict(round_keys)
 
             valid = [r for r in round_results if r.get("valid")]
             invalid = [r for r in round_results if not r.get("valid")]
-            self.log(f"  [{label}] 有效: {len(valid)}, 无效: {len(invalid)}")
+            self.log(f"  [{label}] valid: {len(valid)}, invalid: {len(invalid)}")
 
             for r in valid:
                 k = r["key"]
@@ -1048,7 +1117,7 @@ class ScannerEngine:
             )
 
             if self._should_stop():
-                self.log(f"  达到退出条件: {self._stop_reason()}", "warning")
+                self.log(f"  Exit condition reached: {self._stop_reason()}", "warning")
                 break
 
             time.sleep(1.0)
@@ -1059,12 +1128,16 @@ class ScannerEngine:
 
         positive_only = [r for r in all_results if r.get("balance_usd", 0) > 0]
         self.log(f"\n{'='*40}")
-        self.log(f"多源扫描完成: {elapsed:.0f}s | 有效 {len(all_results)} 个 | 正余额 {len(positive_only)} 个")
+        self.log(f"Multi-source scan done: {elapsed:.0f}s | valid {len(all_results)} | positive balance {len(positive_only)}")
         if positive_only:
             total_usd = sum(r.get("balance_usd", 0) for r in positive_only)
             total_cny = sum(r.get("balance_cny", 0) for r in positive_only)
-            self.log(f"正余额总价值: ${total_usd:.2f} / ¥{total_cny:.2f} (欠费不计入)")
+            self.log(f"Total positive balance: ${total_usd:.2f} / ¥{total_cny:.2f} (overdue not counted)")
 
+        if self._store and self._scan_id:
+            self._store.end_scan(self._scan_id, queries=0,
+                                 candidates=0, valid=len(all_results))
+            self._scan_id = 0
         return all_results
 
     # Scanner factory: (class, search_term, extra_init_kwargs)
@@ -1119,9 +1192,13 @@ class ScannerEngine:
             for r in results:
                 k = r["key"]
                 if k not in discovered:
+                    providers, _ = self._detector.classify(
+                        k, context=f"{r.get('repo','')} {r.get('file','')}")
                     discovered[k] = {
                         "key": k,
                         "key_preview": r.get("key_preview", k[:10] + "..." + k[-4:]),
+                        "providers": providers or self.providers,
+                        "source": source,
                         "repos": [{"repo": r.get("repo", ""), "file": r.get("file", ""),
                                    "url": r.get("url", "")}],
                     }
@@ -1148,81 +1225,95 @@ class ScannerEngine:
         return False
 
     def _scan_one_query(self, query: str) -> dict:
-        """扫描单条查询: 取最多 N 页 (每页100条), 异步并发抓取原始文件"""
+        """Scan a single query: fetch up to N pages (100 per page), grab raw files concurrently"""
         max_pages_to_fetch = getattr(self, 'scan_pages', 5)
         items = []
         for page in range(1, max_pages_to_fetch + 1):
             if page > 1:
-                time.sleep(4.0)  # 页间延迟 4s — 30/min 限制下安全
+                time.sleep(4.0)  # 4s delay between pages — safe under the 30/min limit
             batch = self._gh_search(query, per_page=100, page=page)
             if not batch:
                 break
             items.extend(batch)
-            if len(batch) < 100:  # 最后一页, 无需继续
+            if len(batch) < 100:  # last page, no need to continue
                 break
         if not items:
             return {}
         return asyncio.run(self._scan_one_query_async(items))
 
-    async def _scan_one_query_async(self, items: list) -> dict:
-        """异步并发抓取所有文件并提取 Key"""
-        all_keys = {}
-        seen = set()
-        seen_lock = asyncio.Lock()
-        sem = asyncio.Semaphore(15)  # 并发抓取 15 个文件
+    async def _extract_item(self, session, sem, seen, seen_lock, item,
+                            proxy=_AUTO):
+        """Fetch one search hit's raw file and extract key candidates."""
+        repo = item.get("repository", {}).get("full_name", "")
+        path = item.get("path", "")
+        html_url = item.get("html_url", "")
+        if not repo or not path:
+            return []
+        if any(fnmatch.fnmatch(repo, p) for p in self.exclude_repos):
+            return []
+        # Skip test/demo files (vast majority are zero-balance)
+        if self._is_likely_test_key(path, repo):
+            return []
 
-        async def fetch_and_extract(item):
-            repo = item.get("repository", {}).get("full_name", "")
-            path = item.get("path", "")
-            html_url = item.get("html_url", "")
-            if not repo or not path:
+        # Lock-guarded dedup check
+        cache = f"{repo}/{path}"
+        async with seen_lock:
+            if cache in seen:
                 return []
-            if any(fnmatch.fnmatch(repo, p) for p in self.exclude_repos):
-                return []
-            # Skip test/demo files (vast majority are zero-balance)
-            if self._is_likely_test_key(path, repo):
-                return []
+            seen.add(cache)
 
-            # 线程安全的去重检查
-            cache = f"{repo}/{path}"
-            async with seen_lock:
-                if cache in seen:
-                    return []
-                seen.add(cache)
+        branch = "main"
+        if "/blob/" in html_url:
+            branch = html_url.split("/blob/")[1].split("/")[0]
 
-            branch = "main"
-            if "/blob/" in html_url:
-                branch = html_url.split("/blob/")[1].split("/")[0]
+        text = await self._fetch_raw_async(sem, repo, path, branch,
+                                           session=session, proxy=proxy)
+        if not text:
+            return []
 
-            text = await self._fetch_raw_async(sem, repo, path, branch)
-            if not text:
-                return []
+        cands = self._detector.extract(text, context=f"{repo} {path}")
+        return [(c.key, repo, path, html_url, c.providers) for c in cands]
 
-            keys = self.key_pattern.findall(text)
-            keys = [k for k in keys if not is_bad_key(k, self.extra_bad_patterns)]
-            result = []
-            for k in keys:
-                result.append((k, repo, path, html_url))
-            return result
-
-        async with aiohttp.ClientSession() as session:
-            self._async_session = session
-            tasks = [fetch_and_extract(item) for item in items]
-            batch_results = await asyncio.gather(*tasks)
-            self._async_session = None
-
+    def _merge_candidates(self, all_keys: dict, batch_results: list):
         for results in batch_results:
-            for k, repo, path, html_url in results:
+            for k, repo, path, html_url, providers in results:
                 if k not in all_keys:
-                    all_keys[k] = {"key": k, "key_preview": k[:10] + "..." + k[-4:], "repos": []}
+                    all_keys[k] = {"key": k, "key_preview": k[:10] + "..." + k[-4:],
+                                   "repos": [], "providers": providers,
+                                   "source": "github"}
                 if repo not in [r["repo"] for r in all_keys[k]["repos"]]:
                     all_keys[k]["repos"].append({"repo": repo, "file": path, "url": html_url})
                     self.log(f"  [KEY] {k[:10]}...{k[-4:]} | {repo}/{path}")
 
+    async def _scan_one_query_async(self, items: list, session=None,
+                                    proxy=_AUTO) -> dict:
+        """Fetch all files concurrently and extract keys"""
+        all_keys = {}
+        seen = set()
+        seen_lock = asyncio.Lock()
+        sem = asyncio.Semaphore(15)  # fetch 15 files concurrently
+
+        own_session = session is None
+        if own_session:
+            session = aiohttp.ClientSession()
+            self._async_session = session
+        try:
+            tasks = [self._extract_item(session, sem, seen, seen_lock,
+                                        item, proxy) for item in items]
+            batch_results = await asyncio.gather(*tasks)
+        finally:
+            if own_session:
+                self._async_session = None
+                await session.close()
+
+        self._merge_candidates(all_keys, batch_results)
         return all_keys
 
-    async def _fetch_raw_async(self, sem: asyncio.Semaphore, repo: str, path: str, branch: str = "main") -> str:
-        """异步抓取原始文件内容 (尝试多个分支名)"""
+    async def _fetch_raw_async(self, sem: asyncio.Semaphore, repo: str,
+                               path: str, branch: str = "main",
+                               session=None, proxy=_AUTO) -> str:
+        """Fetch raw file content async (tries multiple branch names)"""
+        sess = session or self._async_session
         async with sem:
             tried = set()
             for br in [branch, "main", "master", "develop", "dev", "HEAD"]:
@@ -1230,57 +1321,177 @@ class ScannerEngine:
                     continue
                 tried.add(br)
                 url = f"https://raw.githubusercontent.com/{repo}/{br}/{path}"
+                px = (self._proxy_pool.next(url) if proxy is _AUTO
+                      else proxy)
                 try:
-                    async with self._async_session.get(url,
-                                                        timeout=aiohttp.ClientTimeout(total=8),
-                                                        headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                    async with sess.get(url,
+                                        proxy=px,
+                                        timeout=aiohttp.ClientTimeout(total=8),
+                                        headers={"User-Agent": "Mozilla/5.0"}) as resp:
                         if resp.status == 200:
                             return await resp.text()
                 except Exception:
-                    pass
+                    if px:
+                        self._proxy_pool.mark_bad(px)
             return ""
 
+    # ---- Parallel batched search (one worker per proxy/token pair) ----
+
+    async def _gh_search_async(self, session, query: str, per_page: int = 100,
+                               page: int = 1, proxy=None, token=None) -> list:
+        """Async GitHub code search. Uses the worker's dedicated token if
+        given, else acquires one from the pool. Honours rate-limit headers."""
+        encoded = urllib.parse.quote(query, safe=":+")
+        url = (f"https://api.github.com/search/code?q={encoded}"
+               f"&per_page={per_page}&page={page}")
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": self.user_agent,
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        for attempt in range(3):
+            tok = token or (self._token_pool.acquire() if self._token_pool
+                            else self.get_gh_token())
+            if tok:
+                headers["Authorization"] = f"Bearer {tok}"
+            try:
+                async with session.get(
+                        url, headers=headers, proxy=proxy,
+                        timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    if self._token_pool and tok:
+                        self._token_pool.update(tok, resp.headers)
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("items", [])
+                    if resp.status in (403, 429):
+                        ra = resp.headers.get("Retry-After")
+                        wait = int(ra) if ra else 10 + (2 ** attempt) * 15
+                        if self._token_pool and tok:
+                            self._token_pool.cooldown(tok, wait)
+                        self.log(f"GitHub rate limit (HTTP {resp.status}), "
+                                 f"waiting {wait}s", "warning")
+                        await asyncio.sleep(wait)
+                        continue
+                    if resp.status == 422:
+                        return []
+                    await asyncio.sleep(5 + attempt * 5)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if proxy:
+                    self._proxy_pool.mark_bad(proxy)
+                self.log(f"GitHub async network error: {type(e).__name__} "
+                         f"(attempt {attempt+1})", "warning")
+                await asyncio.sleep(3 + attempt * 3)
+        return []
+
+    async def _query_worker(self, query: str, proxy, token) -> dict:
+        """One worker: all pages of one query + concurrent raw fetches,
+        all through its own proxy/token pair."""
+        keys = {}
+        async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=20)) as session:
+            items = []
+            for page in range(1, self.scan_pages + 1):
+                if self._should_stop():
+                    break
+                if page > 1:
+                    await asyncio.sleep(4.0)
+                batch = await self._gh_search_async(
+                    session, query, page=page, proxy=proxy, token=token)
+                if not batch:
+                    break
+                items.extend(batch)
+                if len(batch) < 100:
+                    break
+            if not items:
+                return keys
+            found = await self._scan_one_query_async(
+                items, session=session, proxy=proxy)
+            return found
+
+    async def _scan_queries_parallel(self, queries: list) -> dict:
+        """Run len(queries) workers concurrently — worker i uses
+        proxies[i % n_proxies] and tokens[i % n_tokens] (pool fallback)."""
+        proxies = list(self._proxy_pool._proxies) or [None]
+        tokens = self._gh_tokens or []
+
+        async def run_one(i, q):
+            proxy = proxies[i % len(proxies)]
+            token = tokens[i % len(tokens)] if tokens else None
+            self.log(f"  [worker {i}] {q} "
+                     f"(proxy={proxy or 'direct'}, token={'own' if token else 'pool'})")
+            try:
+                return await self._query_worker(q, proxy, token)
+            except Exception as e:
+                self.log(f"  [worker {i}] error: {e}", "error")
+                return {}
+
+        results = await asyncio.gather(
+            *[run_one(i, q) for i, q in enumerate(queries)])
+        merged = {}
+        for kd in results:
+            for k, v in kd.items():
+                if k not in merged:
+                    merged[k] = v
+                else:
+                    for r in v["repos"]:
+                        if r["repo"] not in [x["repo"] for x in merged[k]["repos"]]:
+                            merged[k]["repos"].append(r)
+        return merged
+
     def _verify_dict(self, keys_dict: dict) -> list:
-        """验证一个 key 字典, 返回结果列表"""
+        """Verify a dict of keys, return a result list"""
         if not keys_dict:
             return []
         return asyncio.run(self._verify_all_async(keys_dict))
 
+    def _exportable(self, r: dict) -> dict:
+        """Result dict safe to write to disk. When store_raw_keys=False the
+        raw key is replaced by its sha256 hash (preview stays)."""
+        if self.store_raw_keys:
+            return r
+        r = dict(r)
+        raw = r.pop("key", "")
+        r["key_hash"] = _key_hash(raw) if raw else r.get("key_hash", "")
+        return r
+
     def _save_incremental(self, valid_results: list, round_idx: int, total_rounds: int):
-        """增量保存: JSON + CSV 全部覆写（CSV 不再追加，避免重复）"""
+        """Incremental save: rewrite JSON + CSV in full (CSV no longer appends, to avoid duplicates)"""
         os.makedirs(self.output_dir, exist_ok=True)
         sorted_r = self.sort_results(valid_results)
 
-        # CSV 覆写 (去重)
+        # CSV rewrite (dedup)
         csv_path = os.path.join(self.output_dir, "api_keys_result.csv")
         try:
             with open(csv_path, "w", encoding="utf-8", newline="") as f:
-                f.write("Key预览,完整Key,提供商,有效,原始余额,币种,USD等值,CNY等值,仓库名,文件名,文件路径,仓库链接,验证时间\n")
+                f.write("Key预览,Key标识,提供商,有效,原始余额,币种,USD等值,CNY等值,仓库名,文件名,文件路径,仓库链接,验证时间\n")
                 for r in sorted_r:
+                    er = self._exportable(r)
+                    key_id = er.get("key") or er.get("key_hash", "")
                     repos_str = "; ".join([x["repo"] for x in r.get("repos", [])[:3]])
                     file_names = "; ".join([x.get("file", "").split("/")[-1] for x in r.get("repos", [])[:3]])
                     file_paths = "; ".join([x.get("file", "") for x in r.get("repos", [])[:3]])
                     repo_urls = "; ".join([x.get("url", "") for x in r.get("repos", [])[:3]])
                     cur = r.get("primary_currency", "N/A")
                     provider = r.get("provider", "?")
-                    f.write(f'{r["key_preview"]},{r["key"]},{provider},{r["valid"]},'
+                    f.write(f'{r["key_preview"]},{key_id},{provider},{r["valid"]},'
                             f'{r["balance"]:.4f},{cur},{r["balance_usd"]:.2f},{r["balance_cny"]:.2f},'
                             f'"{repos_str}","{file_names}","{file_paths}","{repo_urls}",{r["verified_at"]}\n')
         except PermissionError:
             pass
 
-        # JSON 覆写
+        # JSON rewrite
         json_path = os.path.join(self.output_dir, "api_keys_result.json")
         try:
             with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(sorted_r, f, ensure_ascii=False, indent=2)
+                json.dump([self._exportable(r) for r in sorted_r],
+                          f, ensure_ascii=False, indent=2)
         except PermissionError:
             pass
 
-        self.log(f"  增量保存: {len(valid_results)} 条有效Key | 轮次 {round_idx+1}/{total_rounds}")
+        self.log(f"  Incremental save: {len(valid_results)} valid keys | round {round_idx+1}/{total_rounds}")
 
     def _save_final(self, valid_results: list):
-        """最终保存"""
+        """Final save"""
         sorted_r = self.sort_results(valid_results)
         os.makedirs(self.output_dir, exist_ok=True)
 
@@ -1288,10 +1499,11 @@ class ScannerEngine:
         json_path = os.path.join(self.output_dir, "api_keys_result.json")
         try:
             with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(sorted_r, f, ensure_ascii=False, indent=2)
-            self.log(f"最终保存 JSON: {json_path} ({len(sorted_r)} 条)")
+                json.dump([self._exportable(r) for r in sorted_r],
+                          f, ensure_ascii=False, indent=2)
+            self.log(f"Final save JSON: {json_path} ({len(sorted_r)} entries)")
         except Exception as e:
-            self.log(f"JSON 保存失败: {e}", "error")
+            self.log(f"JSON save failed: {e}", "error")
 
         # Markdown
         md_path = os.path.join(self.output_dir, "api_keys_result.md")
@@ -1318,9 +1530,9 @@ class ScannerEngine:
                     prov = r.get("provider", "?").upper()
                     f.write(f"| {i+1} | `{r['key_preview']}` | {prov} | {cur} {r['balance']:.4f} | "
                             f"${r['balance_usd']:.2f} | ¥{r['balance_cny']:.2f} | {src} |\n")
-            self.log(f"最终保存 Markdown: {md_path}")
+            self.log(f"Final save Markdown: {md_path}")
         except Exception as e:
-            self.log(f"Markdown 保存失败: {e}", "error")
+            self.log(f"Markdown save failed: {e}", "error")
 
     def _should_stop(self) -> bool:
         if self._stop_requested:
@@ -1335,11 +1547,11 @@ class ScannerEngine:
 
     def _stop_reason(self) -> str:
         if self._stop_requested:
-            return "手动停止"
+            return "manual stop"
         if self.max_duration > 0 and time.time() - self._start_time >= self.max_duration:
-            return f"达到时间限制 ({self.max_duration}s)"
+            return f"time limit reached ({self.max_duration}s)"
         if self.max_valid_keys > 0 and self._valid_count >= self.max_valid_keys:
-            return f"达到有效 Key 数量目标 ({self.max_valid_keys})"
+            return f"valid key target reached ({self.max_valid_keys})"
         return ""
 
     def _auto_save(self, results: list, force: bool = False):
@@ -1354,7 +1566,7 @@ class ScannerEngine:
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(sorted_r, f, ensure_ascii=False, indent=2)
-            self.log(f"实时保存: {n} 条结果 → {path}", "info")
+            self.log(f"Auto-save: {n} results → {path}", "info")
         except Exception as e:
             pass  # silent fail for autosave
 
@@ -1366,26 +1578,29 @@ class ScannerEngine:
         Tracks X-RateLimit-Remaining to avoid hitting the rate limit."""
         encoded = urllib.parse.quote(query, safe=":+")
         url = f"https://api.github.com/search/code?q={encoded}&per_page={per_page}&page={page}"
-        token = self.get_gh_token()
         headers = {
             "Accept": "application/vnd.github+json",
-            "User-Agent": "DeepSeekKeyHunter/5.0",
+            "User-Agent": self.user_agent,
             "X-GitHub-Api-Version": "2022-11-28",
         }
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
 
         max_retries = 3
         for attempt in range(max_retries):
+            token = (self._token_pool.acquire() if self._token_pool
+                     else self.get_gh_token())
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
             try:
                 r = requests.get(url, headers=headers, timeout=20)
+                if self._token_pool and token:
+                    self._token_pool.update(token, r.headers)
                 remaining = r.headers.get("X-RateLimit-Remaining")
                 if remaining:
                     remaining = int(remaining)
                     if remaining < 5:
                         reset_ts = int(r.headers.get("X-RateLimit-Reset", 0))
                         wait = max(5, reset_ts - int(time.time()) + 1) if reset_ts else 30
-                        self.log(f"GitHub 限流预警: 剩余 {remaining} 次, 等待 {wait}s", "warning")
+                        self.log(f"GitHub rate-limit warning: {remaining} left, waiting {wait}s", "warning")
                         time.sleep(wait)
 
                 if r.status_code == 200:
@@ -1395,7 +1610,9 @@ class ScannerEngine:
                     # Use Retry-After header if available, else exponential backoff
                     retry_after = r.headers.get("Retry-After")
                     wait = int(retry_after) if retry_after else (10 + (2 ** attempt) * 15)
-                    self.log(f"GitHub API 限流 (HTTP {r.status_code}), 等待 {wait}s (attempt {attempt+1})...", "warning")
+                    if self._token_pool and token:
+                        self._token_pool.cooldown(token, wait)
+                    self.log(f"GitHub API rate limit (HTTP {r.status_code}), waiting {wait}s (attempt {attempt+1})...", "warning")
                     time.sleep(wait)
                     continue
                 elif r.status_code == 422:
@@ -1407,7 +1624,7 @@ class ScannerEngine:
                         continue
                     return []
             except (requests.RequestException, requests.Timeout) as e:
-                self.log(f"GitHub API 网络错误: {e} (attempt {attempt+1})", "warning")
+                self.log(f"GitHub API network error: {e} (attempt {attempt+1})", "warning")
                 if attempt < max_retries - 1:
                     time.sleep(3 + attempt * 3)
                 else:
@@ -1417,13 +1634,17 @@ class ScannerEngine:
     def _fetch_raw(self, repo: str, path: str, branch: str = "main") -> str:
         for br in [branch, "main", "master"]:
             url = f"https://raw.githubusercontent.com/{repo}/{br}/{path}"
+            proxy = self._proxy_pool.next(url) if self._proxy_pool else None
             try:
                 resp = requests.get(url, timeout=self.timeout,
-                                    headers={"User-Agent": "Mozilla/5.0"})
+                                    headers={"User-Agent": "Mozilla/5.0"},
+                                    proxies={"http": proxy, "https": proxy}
+                                    if proxy else None)
                 if resp.status_code == 200:
                     return resp.text
             except Exception:
-                pass
+                if proxy:
+                    self._proxy_pool.mark_bad(proxy)
         return ""
 
     def scan_github(self, queries: list) -> dict:
@@ -1440,10 +1661,10 @@ class ScannerEngine:
             self.progress_callback(i + 1, len(queries), "search")
 
             items = self._gh_search(query)
-            self.log(f"  结果: {len(items)} 个文件")
+            self.log(f"  Results: {len(items)} files")
 
             for j, item in enumerate(items):
-                # 检查遍历中是否超时（每 5 个文件或时间到就跳出）
+                # Check for timeout while iterating (bail every 5 files)
                 if j % 5 == 0 and self._should_stop():
                     stopped_early = True
                     break
@@ -1469,17 +1690,19 @@ class ScannerEngine:
                 if not text:
                     continue
 
-                keys = self.key_pattern.findall(text)
-                keys = [k for k in keys if not is_bad_key(k, self.extra_bad_patterns)]
+                cands = self._detector.extract(text, context=f"{repo} {path}")
 
-                for k in keys:
+                for c in cands:
+                    k = c.key
                     if k not in all_keys:
-                        all_keys[k] = {"key": k, "key_preview": k[:10] + "..." + k[-4:], "repos": []}
+                        all_keys[k] = {"key": k, "key_preview": k[:10] + "..." + k[-4:],
+                                       "repos": [], "providers": c.providers,
+                                       "source": "github"}
                     if repo not in [r["repo"] for r in all_keys[k]["repos"]]:
                         all_keys[k]["repos"].append({"repo": repo, "file": path, "url": html_url})
                         self.log(f"  [KEY] {k[:10]}...{k[-4:]} | {repo}/{path}")
 
-            # 当前查询处理完后检查是否应停止（不等下一个查询才开始检查）
+            # Check whether to stop right after the current query (don't wait for the next one)
             if stopped_early or self._should_stop():
                 stopped_early = True
                 break
@@ -1596,23 +1819,19 @@ class ScannerEngine:
         return result
 
     async def _verify_one(self, session: aiohttp.ClientSession, api_key: str,
-                          semaphore: asyncio.Semaphore) -> dict:
-        """Verify one API key against all configured providers.
-        Returns result for the first matching provider (valid) or
-        the last attempted provider (invalid).
-        """
+                          semaphore: asyncio.Semaphore,
+                          providers_hint: list = None) -> dict:
+        """Verify one API key against provider candidates (detector-ranked
+        first, falling back to configured provider order). One GET per
+        provider; balance probing only when self.check_balance."""
         async with semaphore:
-            active = self._get_active_providers()
-            last_result = None
-            for provider in active:
-                result = await self._try_provider_endpoint(session, api_key, provider)
-                if result.get("valid"):
-                    return result
-                last_result = result
-            # All providers failed — return last result
-            if last_result:
-                return last_result
-            return {"valid": False, "reason": "no_provider_match"}
+            providers = providers_hint or self.providers
+            result = await _verify_key_external(
+                session, api_key, providers,
+                check_balance=self.check_balance, timeout=self.timeout)
+            if not result.get("provider"):
+                result["provider"] = providers[0] if providers else "unknown"
+            return result
 
     async def _verify_all_async(self, all_keys: dict) -> list:
         semaphore = asyncio.Semaphore(self.concurrency)
@@ -1626,7 +1845,8 @@ class ScannerEngine:
         async with aiohttp.ClientSession() as session:
             async def wrapped(key, info):
                 nonlocal done
-                v = await self._verify_one(session, key, semaphore)
+                v = await self._verify_one(session, key, semaphore,
+                                           info.get("providers"))
                 done[0] += 1
 
                 if v.get("valid"):
@@ -1646,6 +1866,7 @@ class ScannerEngine:
                 entry = {
                     "key": key,
                     "key_preview": info["key_preview"],
+                    "status": v.get("status", ""),
                     "valid": v.get("valid", False),
                     "balance": v.get("total_balance", 0),
                     "balance_details": v.get("balance_details", []),
@@ -1659,9 +1880,14 @@ class ScannerEngine:
                     "provider_note": v.get("provider_note", ""),
                     "balance_unavailable": v.get("balance_unavailable", False),
                     "repos": info["repos"],
+                    "rate_limit": v.get("rate_limit", {}),
                     "verified_at": datetime.now().isoformat(),
                 }
                 results.append(entry)
+                if self._store:
+                    self._store.upsert_result(entry,
+                                              source=info.get("source", ""),
+                                              query=info.get("query", ""))
 
                 # Batch stop: count ALL valid keys (original high-throughput logic)
                 if self.max_valid_keys > 0 and valid_count[0] >= self.max_valid_keys and not batch_stop[0]:
@@ -1727,7 +1953,8 @@ class ScannerEngine:
 
             def _write(p):
                 with open(p, "w", encoding="utf-8") as f:
-                    json.dump(results, f, ensure_ascii=False, indent=2)
+                    json.dump([self._exportable(r) for r in results],
+                              f, ensure_ascii=False, indent=2)
 
             if self._safe_write(path, _write):
                 self.log(f"JSON: {path}")
@@ -1737,12 +1964,14 @@ class ScannerEngine:
 
             def _write(p):
                 with open(p, "w", encoding="utf-8") as f:
-                    f.write("Key预览,完整Key,提供商,有效,原始余额,币种,USD等值,CNY等值,仓库名,文件名,文件路径,仓库链接,验证时间\n")
+                    f.write("Key预览,Key标识,提供商,有效,原始余额,币种,USD等值,CNY等值,仓库名,文件名,文件路径,仓库链接,验证时间\n")
                     for r in results:
+                        er = self._exportable(r)
+                        key_id = er.get("key") or er.get("key_hash", "")
                         repos_str = "; ".join([x["repo"] for x in r["repos"][:3]])
                         cur = r.get("primary_currency", "N/A")
                         provider = r.get("provider", "?")
-                        f.write(f'{r["key_preview"]},{r["key"]},{provider},{r["valid"]},'
+                        f.write(f'{r["key_preview"]},{key_id},{provider},{r["valid"]},'
                                 f'{r["balance"]:.4f},{cur},{r["balance_usd"]:.2f},{r["balance_cny"]:.2f},'
                                 f'"{repos_str}",{r["verified_at"]}\n')
 

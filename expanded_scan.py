@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-扩展扫描 — 使用新源 + 新模式 + 提交历史扫描
-覆盖: GitHub Code Search + Gist + Issues + Commits + HuggingFace + 传统源
+Expanded scan — new sources + new patterns + commit history scanning
+Coverage: GitHub Code Search + Gist + Issues + Commits + HuggingFace + legacy sources
 """
 import sys, time, os, json
 sys.path.insert(0, ".")

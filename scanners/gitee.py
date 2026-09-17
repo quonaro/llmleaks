@@ -1,5 +1,5 @@
 """
-Gitee (码云) Scanner — Search China's largest code hosting platform.
+Gitee Scanner — Search China's largest code hosting platform.
 Targets .env files, config, and source code in public repositories.
 """
 

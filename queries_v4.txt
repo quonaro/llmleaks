@@ -1,4 +1,4 @@
-# DeepSeek Key Hunter Query Library (v5 - 95 entries, hot→cold ordered)
+# llmleaks Query Library (v5 - 95 entries, hot→cold ordered)
 # Generated 2026-05-20 with time-filtered queries for fresh results
 deepseek sk- filename:java
 deepseek sk- filename:properties

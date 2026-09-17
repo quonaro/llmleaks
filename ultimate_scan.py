@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-终极扫描 — 全面覆盖，深度挖掘，无时间限制
-阶段:
-  1. GitHub Code Search — 全部 238 条查询，每查询 10 页
-  2. GitHub 多源 — Commits + Gist + Issues
-  3. 外部平台 — HuggingFace + PyPI + StackOverflow + npm
-  4. 归档/镜像 — Wayback + CommonCrawl
-  5. 国内平台 — Gitee + GitLab
+Ultimate scan — full coverage, deep digging, no time limit
+Phases:
+  1. GitHub Code Search — all 238 queries, 10 pages per query
+  2. GitHub multi-source — Commits + Gist + Issues
+  3. External platforms — HuggingFace + PyPI + StackOverflow + npm
+  4. Archives/mirrors — Wayback + CommonCrawl
+  5. Chinese platforms — Gitee + GitLab
 """
 import sys, time, os, json
 sys.path.insert(0, ".")
@@ -62,7 +62,7 @@ def report_stats():
     neg = [r for r in valid if r.get("balance_usd", 0) < 0]
     total_v = sum(r["balance_usd"] for r in pos)
     log(f"{'='*60}")
-    log(f"累计: {len(merged)} 条 | 有效 {len(valid)} | 正余额 {len(pos)} | 零余额 {len(zero)} | 欠费 {len(neg)}")
+    log(f"Total: {len(merged)} | Valid {len(valid)} | Positive {len(pos)} | Zero {len(zero)} | Overdue {len(neg)}")
     log(f"总价值: ${total_v:.2f}")
     if pos:
         log(f"Top 5:")
@@ -72,7 +72,7 @@ def report_stats():
     return merged
 
 # ═══════════════════════════════════════════════════════════════════
-#  PHASE 1: GitHub Code Search — 全部查询，深度扫描
+#  PHASE 1: GitHub Code Search — all queries, deep scan
 # ═══════════════════════════════════════════════════════════════════
 log("")
 log(f"{'='*60}")
@@ -98,11 +98,11 @@ log(f"PHASE 1 done: {elapsed1:.0f}s | New keys: {new1}")
 report_stats()
 
 # ═══════════════════════════════════════════════════════════════════
-#  PHASE 2: GitHub 生态深度扫描
+#  PHASE 2: GitHub ecosystem deep scan
 # ═══════════════════════════════════════════════════════════════════
 log("")
 log(f"{'='*60}")
-log("PHASE 2: GitHub 生态 — Commits + Gist + Issues")
+log("PHASE 2: GitHub ecosystem — Commits + Gist + Issues")
 log(f"{'='*60}")
 
 engine2 = ScannerEngine(
@@ -123,11 +123,11 @@ log(f"PHASE 2 done: New keys: {new2}")
 report_stats()
 
 # ═══════════════════════════════════════════════════════════════════
-#  PHASE 3: 外部平台 — HuggingFace + PyPI + StackOverflow + npm
+#  PHASE 3: External platforms — HuggingFace + PyPI + StackOverflow + npm
 # ═══════════════════════════════════════════════════════════════════
 log("")
 log(f"{'='*60}")
-log("PHASE 3: 外部平台 — HuggingFace + PyPI + StackOverflow + npm")
+log("PHASE 3: External platforms — HuggingFace + PyPI + StackOverflow + npm")
 log(f"{'='*60}")
 
 engine3 = ScannerEngine(
@@ -148,11 +148,11 @@ log(f"PHASE 3 done: New keys: {new3}")
 report_stats()
 
 # ═══════════════════════════════════════════════════════════════════
-#  PHASE 4: 归档/镜像 — Wayback + CommonCrawl
+#  PHASE 4: Archives/mirrors — Wayback + CommonCrawl
 # ═══════════════════════════════════════════════════════════════════
 log("")
 log(f"{'='*60}")
-log("PHASE 4: 归档/镜像 — Wayback + CommonCrawl")
+log("PHASE 4: Archives/mirrors — Wayback + CommonCrawl")
 log(f"{'='*60}")
 
 engine4 = ScannerEngine(
@@ -173,11 +173,11 @@ log(f"PHASE 4 done: New keys: {new4}")
 report_stats()
 
 # ═══════════════════════════════════════════════════════════════════
-#  PHASE 5: 国内平台 — Gitee + GitLab
+#  PHASE 5: Chinese platforms — Gitee + GitLab
 # ═══════════════════════════════════════════════════════════════════
 log("")
 log(f"{'='*60}")
-log("PHASE 5: 国内平台 — Gitee + GitLab")
+log("PHASE 5: Chinese platforms — Gitee + GitLab")
 log(f"{'='*60}")
 
 engine5 = ScannerEngine(
@@ -207,7 +207,7 @@ log(f"{'='*60}")
 merged = report_stats()
 total_new = new1 + new2 + new3 + new4 + new5
 log(f"")
-log(f"本轮新增总计: {total_new} 个 key")
+log(f"New keys this run: {total_new}")
 log(f"  Phase 1 (GitHub Code):  {new1}")
 log(f"  Phase 2 (GitHub Eco):   {new2}")
 log(f"  Phase 3 (External):     {new3}")

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-API Key Hunter - Multi-Provider CLI (基于 ScannerEngine)
-DeepSeek / OpenAI / OpenRouter 公开仓库暴露 API Key 扫描与验证工具
+API Key Hunter - Multi-Provider CLI (based on ScannerEngine)
+Scan and verify DeepSeek / OpenAI / OpenRouter API keys exposed in public repos
 
-用法示例:
-  python api_key_hunter.py                        # 默认全流程 (DeepSeek+OpenAI+OpenRouter)
-  python api_key_hunter.py --providers deepseek   # 仅扫描 DeepSeek
-  python api_key_hunter.py --providers openai     # 仅扫描 OpenAI
-  python api_key_hunter.py --dry-run              # 只搜索不验证
-  python api_key_hunter.py --resume               # 断点续跑
-  python api_key_hunter.py -c 50                  # 并发 50
+Usage:
+  python api_key_hunter.py                        # default full pipeline (DeepSeek+OpenAI+OpenRouter)
+  python api_key_hunter.py --providers deepseek   # scan DeepSeek only
+  python api_key_hunter.py --providers openai     # scan OpenAI only
+  python api_key_hunter.py --dry-run              # search only, no verify
+  python api_key_hunter.py --resume               # resume from checkpoint
+  python api_key_hunter.py -c 50                  # concurrency 50
   python api_key_hunter.py --verify-only results/api_keys_result.json
   python api_key_hunter.py --verify-only results/.akh_progress.json
 """
@@ -35,23 +35,23 @@ ALL_PROVIDERS = [p["name"] for p in PROVIDER_CONFIGS]  # deepseek, openai, openr
 def build_parser():
     p = argparse.ArgumentParser(
         prog="api-key-hunter",
-        description="API Key Hunter - 多提供商公开仓库暴露 API Key 扫描工具 (DeepSeek/OpenAI/OpenRouter)",
+        description="API Key Hunter - scan public repos for exposed API keys (DeepSeek/OpenAI/OpenRouter)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例:
-  %(prog)s                                         默认全流程 (全部提供商)
-  %(prog)s --providers deepseek                    仅扫描 DeepSeek
-  %(prog)s --providers openai,openrouter           仅扫描 OpenAI + OpenRouter
-  %(prog)s --dry-run                               仅搜索，不验证
-  %(prog)s --resume                                断点续跑
-  %(prog)s -c 50                                   提高并发
-  %(prog)s --verify-only results/api_keys_result.json        仅验证已有结果
+Examples:
+  %(prog)s                                         default full pipeline (all providers)
+  %(prog)s --providers deepseek                    scan DeepSeek only
+  %(prog)s --providers openai,openrouter           scan OpenAI + OpenRouter only
+  %(prog)s --dry-run                               search only, no verify
+  %(prog)s --resume                                resume from checkpoint
+  %(prog)s -c 50                                   higher concurrency
+  %(prog)s --verify-only results/api_keys_result.json        verify existing results only
   %(prog)s --verify-only results/.akh_progress.json
-  %(prog)s --queries-file queries_v4.txt           使用自定义查询文件
-  %(prog)s --min-balance 0.01                      过滤余额 >= $0.01 的 Key
-  %(prog)s --cmd-gen                               打开命令生成器网页
+  %(prog)s --queries-file queries_v4.txt           use a custom queries file
+  %(prog)s --min-balance 0.01                      filter keys with balance >= $0.01
+  %(prog)s --cmd-gen                               open the command generator page
 
-提供商:
+Providers:
   deepseek  - DeepSeek API (api.deepseek.com)
   openai    - OpenAI API (api.openai.com)
   openrouter - OpenRouter API (openrouter.ai)
@@ -59,58 +59,58 @@ def build_parser():
         """,
     )
 
-    g = p.add_argument_group("通用")
-    g.add_argument("-c", "--concurrency", type=int, default=20, help="并发数 (默认: 20)")
-    g.add_argument("--timeout", type=int, default=15, help="HTTP 超时秒数 (默认: 15)")
-    g.add_argument("--output-dir", type=str, default="./results", help="输出目录")
-    g.add_argument("-q", "--quiet", action="store_true", help="安静模式")
+    g = p.add_argument_group("General")
+    g.add_argument("-c", "--concurrency", type=int, default=20, help="concurrency (default: 20)")
+    g.add_argument("--timeout", type=int, default=15, help="HTTP timeout in seconds (default: 15)")
+    g.add_argument("--output-dir", type=str, default="./results", help="output directory")
+    g.add_argument("-q", "--quiet", action="store_true", help="quiet mode")
 
-    g_prov = p.add_argument_group("提供商 (新)")
+    g_prov = p.add_argument_group("Providers (new)")
     g_prov.add_argument("--providers", type=str, default="all",
-                        help=f"验证提供商, 逗号分隔. 可选: {', '.join(ALL_PROVIDERS)}, all (默认: all)")
+                        help=f"providers to verify, comma-separated. Options: {', '.join(ALL_PROVIDERS)}, all (default: all)")
 
-    g_search = p.add_argument_group("搜索")
-    g_search.add_argument("--search-delay", type=float, default=2.5, help="请求间隔秒数 (默认: 2.5)")
-    g_search.add_argument("--scan-pages", type=int, default=10, help="每个查询翻页数 1-10 (默认: 10, 每页100条)")
-    g_search.add_argument("--queries-file", type=str, default=None, help="自定义查询文件")
-    g_search.add_argument("--skip-builtin", action="store_true", help="跳过内置查询")
+    g_search = p.add_argument_group("Search")
+    g_search.add_argument("--search-delay", type=float, default=2.5, help="delay between requests in seconds (default: 2.5)")
+    g_search.add_argument("--scan-pages", type=int, default=10, help="pages per query 1-10 (default: 10, 100 results per page)")
+    g_search.add_argument("--queries-file", type=str, default=None, help="custom queries file")
+    g_search.add_argument("--skip-builtin", action="store_true", help="skip built-in queries")
 
-    g_multi = p.add_argument_group("多源扫描 (新)")
+    g_multi = p.add_argument_group("Multi-source scan (new)")
     g_multi.add_argument("--sources", type=str, default="github",
-                         help="扫描来源, 逗号分隔. 可选: github, gist, issues, gitlab, wayback, docker, commoncrawl, gitee, npm, all (默认: github)")
-    g_multi.add_argument("--monitor", action="store_true", help="实时监控模式 (GitHub Events API)")
+                         help="scan sources, comma-separated. Options: github, gist, issues, gitlab, wayback, docker, commoncrawl, gitee, npm, all (default: github)")
+    g_multi.add_argument("--monitor", action="store_true", help="real-time monitor mode (GitHub Events API)")
     g_multi.add_argument("--github-token", type=str, default="", help="GitHub Personal Access Token")
     g_multi.add_argument("--gitlab-token", type=str, default="", help="GitLab Personal Access Token")
     g_multi.add_argument("--gitee-token", type=str, default="", help="Gitee Access Token")
 
-    g_filter = p.add_argument_group("过滤")
-    g_filter.add_argument("--min-key-length", type=int, default=32, help="最短 Key 长度")
-    g_filter.add_argument("--max-key-length", type=int, default=64, help="最长 Key 长度")
-    g_filter.add_argument("--min-balance", type=float, default=None, help="只输出 USD 余额 >= 该值的 Key")
-    g_filter.add_argument("--exclude-repo", type=str, action="append", default=[], help="排除仓库")
+    g_filter = p.add_argument_group("Filter")
+    g_filter.add_argument("--min-key-length", type=int, default=32, help="min key length")
+    g_filter.add_argument("--max-key-length", type=int, default=64, help="max key length")
+    g_filter.add_argument("--min-balance", type=float, default=None, help="only output keys with USD balance >= this value")
+    g_filter.add_argument("--exclude-repo", type=str, action="append", default=[], help="exclude repo")
     g_filter.add_argument("--usd-cny-rate", type=float, default=DEFAULT_USD_CNY_RATE,
-                          help=f"USD/CNY 汇率 (默认: {DEFAULT_USD_CNY_RATE})")
+                          help=f"USD/CNY exchange rate (default: {DEFAULT_USD_CNY_RATE})")
 
-    g_verify = p.add_argument_group("验证")
-    g_verify.add_argument("--dry-run", action="store_true", help="仅搜索不验证")
-    g_verify.add_argument("--verify-only", type=str, default=None, help="仅验证 JSON/Progress 文件")
+    g_verify = p.add_argument_group("Verify")
+    g_verify.add_argument("--dry-run", action="store_true", help="search only, no verify")
+    g_verify.add_argument("--verify-only", type=str, default=None, help="only verify a JSON/progress file")
 
-    g_stop = p.add_argument_group("退出机制 (自动停止)")
+    g_stop = p.add_argument_group("Exit conditions (auto stop)")
     g_stop.add_argument("--max-duration", type=int, default=0,
-                       help="最大运行时长(秒), 超时自动保存退出 (默认: 0=不限)")
+                       help="max run duration in seconds; auto-save and exit on timeout (default: 0=unlimited)")
     g_stop.add_argument("--max-valid-keys", type=int, default=0,
-                       help="收集到此数量的有效Key后自动保存退出 (默认: 0=不限)")
+                       help="auto-save and exit after collecting this many valid keys (default: 0=unlimited)")
     g_stop.add_argument("--auto-save-interval", type=int, default=20,
-                       help="每验证N个Key自动保存结果 (默认: 20)")
+                       help="auto-save results every N verified keys (default: 20)")
 
-    g_output = p.add_argument_group("输出")
-    g_output.add_argument("--format", choices=["all", "json", "csv", "markdown"], default="all", help="输出格式")
+    g_output = p.add_argument_group("Output")
+    g_output.add_argument("--format", choices=["all", "json", "csv", "markdown"], default="all", help="output format")
 
-    g_resume = p.add_argument_group("进度")
-    g_resume.add_argument("--resume", action="store_true", help="从进度文件恢复")
+    g_resume = p.add_argument_group("Progress")
+    g_resume.add_argument("--resume", action="store_true", help="resume from progress file")
 
-    g_gui = p.add_argument_group("界面")
-    g_gui.add_argument("--cmd-gen", action="store_true", help="打开命令生成器网页 (cmd_generator.html)")
+    g_gui = p.add_argument_group("UI")
+    g_gui.add_argument("--cmd-gen", action="store_true", help="open the command generator page (cmd_generator.html)")
 
     return p
 
@@ -131,28 +131,28 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    # 命令生成器
+    # Command generator
     if args.cmd_gen:
         import webbrowser
         gen_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cmd_generator.html")
         if os.path.exists(gen_path):
             webbrowser.open(f"file://{gen_path}")
-            print(f"已打开命令生成器: {gen_path}")
+            print(f"Opened command generator: {gen_path}")
         else:
-            print("[ERROR] 未找到 cmd_generator.html")
+            print("[ERROR] cmd_generator.html not found")
         return
 
-    # 解析提供商
+    # Resolve providers
     if args.providers == "all":
         providers = ALL_PROVIDERS
     else:
         providers = [p.strip() for p in args.providers.split(",") if p.strip()]
         unknown = [p for p in providers if p not in ALL_PROVIDERS]
         if unknown:
-            print(f"[ERROR] 未知提供商: {unknown}. 可用: {', '.join(ALL_PROVIDERS)}")
+            print(f"[ERROR] Unknown providers: {unknown}. Available: {', '.join(ALL_PROVIDERS)}")
             return
 
-    # 获取查询
+    # Load queries
     queries = []
     if not args.skip_builtin:
         queries.extend(BUILTIN_QUERIES)
@@ -161,21 +161,21 @@ def main():
     if not queries:
         queries = BUILTIN_QUERIES
 
-    # 自动调整搜索延迟
+    # Auto-adjust search delay
     if not args.search_delay or args.search_delay == 2.5:
         suggested = ScannerEngine.suggested_search_delay()
         args.search_delay = suggested
 
-    rate_limit = "30次/分钟 (已认证)" if ScannerEngine.check_gh_auth() else "10次/分钟 (未认证)"
+    rate_limit = "30 req/min (authenticated)" if ScannerEngine.check_gh_auth() else "10 req/min (unauthenticated)"
 
     print(f"API Key Hunter - Multi-Provider CLI")
     print(f"Providers: {', '.join(providers)} | Queries: {len(queries)}")
     print(f"Concurrency: {args.concurrency} | Rate: 1 USD = {args.usd_cny_rate} CNY")
-    print(f"API限额: {rate_limit} | 搜索间隔: {args.search_delay}s")
+    print(f"API limit: {rate_limit} | Search delay: {args.search_delay}s")
     print(f"Output: {args.output_dir}")
     print()
 
-    # 创建引擎
+    # Create engine
     engine = ScannerEngine(
         concurrency=args.concurrency,
         timeout=args.timeout,
@@ -193,7 +193,7 @@ def main():
         log_callback=log_func if not args.quiet else (lambda m, l: None),
     )
 
-    # 仅验证模式
+    # Verify-only mode
     if args.verify_only:
         all_keys = ScannerEngine.load_keys_from_file(args.verify_only)
         print(f"Loaded {len(all_keys)} keys from {args.verify_only}")
@@ -203,7 +203,7 @@ def main():
         _print_summary(results, engine.usd_cny_rate, providers)
         return
 
-    # 多源扫描模式
+    # Multi-source scan mode
     sources_str = args.sources.lower().strip()
     if sources_str != "github" or args.monitor:
         t0 = time.time()
@@ -211,7 +211,7 @@ def main():
             sources = ["github", "gist", "issues", "gitlab", "wayback",
                        "docker", "commoncrawl", "gitee", "npm"]
         elif sources_str == "events":
-            print("--- Events Monitor (实时监控 GitHub PushEvent) ---")
+            print("--- Events Monitor (real-time GitHub PushEvent) ---")
             from scanners.github_events import EventsMonitor
             import asyncio
 
@@ -246,7 +246,7 @@ def main():
             return
 
         elif args.monitor:
-            print("--- 实时监控模式 (GitHub Events API) ---")
+            print("--- Real-time monitor mode (GitHub Events API) ---")
             from scanners.github_events import EventsMonitor
             import asyncio
 
@@ -273,7 +273,7 @@ def main():
         else:
             sources = [s.strip() for s in sources_str.split(",") if s.strip()]
 
-        print(f"--- 多源扫描模式: {sources} ---")
+        print(f"--- Multi-source scan mode: {sources} ---")
         print(f"Providers: {', '.join(providers)} | Sources: {len(sources)} | Concurrency: {args.concurrency}")
         print(f"Output: {args.output_dir}")
         print()
@@ -289,41 +289,41 @@ def main():
         if args.min_balance is not None and args.min_balance > 0:
             before = len(results)
             results = [r for r in results if r["balance_usd"] >= args.min_balance]
-            print(f"余额过滤: {before} -> {len(results)} (min ${args.min_balance})")
+            print(f"Balance filter: {before} -> {len(results)} (min ${args.min_balance})")
 
         engine._save_final(results)
         _print_summary(results, engine.usd_cny_rate, providers)
-        print(f"\n总耗时: {time.time()-t0:.1f}s")
+        print(f"\nTotal time: {time.time()-t0:.1f}s")
         return
 
-    # Dry run 模式
+    # Dry run mode
     if args.dry_run:
-        print(f"--- Dry Run (仅搜索不验证) ---")
+        print(f"--- Dry Run (search only, no verify) ---")
         all_keys = engine.scan_github(queries)
-        print(f"\n发现 {len(all_keys)} 个疑似 Key (未验证)")
+        print(f"\nFound {len(all_keys)} candidate keys (unverified)")
         if all_keys:
             engine.save_progress(all_keys)
         return
 
-    # 主流水线: 逐条查询 → 搜索 → 验证 → 保存 → 检查退出
+    # Main pipeline: query by query -> search -> verify -> save -> check exit
     t0 = time.time()
-    print(f"--- Pipeline: 边扫边验边存 (Ctrl+C 安全退出) ---")
+    print(f"--- Pipeline: scan/verify/save on the fly (Ctrl+C for safe exit) ---")
     try:
         results = engine.run(queries)
     except KeyboardInterrupt:
-        print(f"\n[!] 已中断, 结果已自动保存到 {args.output_dir}")
+        print(f"\n[!] Interrupted, results auto-saved to {args.output_dir}")
         return
 
-    # 最低余额过滤
+    # Min balance filter
     if args.min_balance is not None and args.min_balance > 0:
         before = len(results)
         results = [r for r in results if r["balance_usd"] >= args.min_balance]
-        print(f"余额过滤: {before} -> {len(results)} (min ${args.min_balance})")
+        print(f"Balance filter: {before} -> {len(results)} (min ${args.min_balance})")
 
-    # 写入最终 CSV
+    # Write final CSV
     engine._save_final(results)
     _print_summary(results, engine.usd_cny_rate, providers)
-    print(f"\n总耗时: {time.time()-t0:.1f}s")
+    print(f"\nTotal time: {time.time()-t0:.1f}s")
 
 
 def _print_summary(results, rate, providers=None):
@@ -333,37 +333,37 @@ def _print_summary(results, rate, providers=None):
     zero = [r for r in valid if r["balance_usd"] == 0]
     negative = [r for r in valid if r["balance_usd"] < 0]
 
-    # 按提供商统计
+    # Per-provider stats
     by_provider = {}
     for r in valid:
         prov = r.get("provider", "unknown")
         by_provider.setdefault(prov, []).append(r)
 
     print(f"\n{'='*60}")
-    print(f"  API Key Hunter — 扫描总结")
+    print(f"  API Key Hunter — Scan summary")
     print(f"{'='*60}")
     if providers:
-        print(f"  提供商: {', '.join(providers)}")
-    print(f"  总共扫描 Key 数: {len(results)}")
-    print(f"  有效 Key:       {len(valid)}")
-    print(f"  无效 Key:       {len(invalid)}")
-    print(f"  正余额 (>$0):   {len(positive)}")
-    print(f"  零余额 (= $0):  {len(zero)}")
-    print(f"  欠费 (< $0):    {len(negative)} (不计入总价值)")
+        print(f"  Providers: {', '.join(providers)}")
+    print(f"  Total keys scanned:  {len(results)}")
+    print(f"  Valid keys:          {len(valid)}")
+    print(f"  Invalid keys:        {len(invalid)}")
+    print(f"  Positive (>$0):      {len(positive)}")
+    print(f"  Zero (= $0):         {len(zero)}")
+    print(f"  Overdue (< $0):      {len(negative)} (not counted in total value)")
 
-    # 按提供商统计
+    # Per-provider stats
     if by_provider and len(by_provider) > 1:
-        print(f"\n  按提供商分布:")
+        print(f"\n  By provider:")
         for prov, keys in sorted(by_provider.items(), key=lambda x: -len(x[1])):
             usd_p = sum(k["balance_usd"] for k in keys if k["balance_usd"] > 0)
-            print(f"    {prov.upper():12s}: {len(keys):3d} 个 Key, 正余额 ${usd_p:.2f}")
+            print(f"    {prov.upper():12s}: {len(keys):3d} keys, positive ${usd_p:.2f}")
 
     if positive:
         usd_pos = sum(r["balance_usd"] for r in positive)
         cny_pos = sum(r["balance_cny"] for r in positive)
-        print(f"\n  正余额总价值: ${usd_pos:.2f} USD / ¥{cny_pos:.2f} CNY")
-        print(f"  汇率: 1 USD = {rate} CNY")
-        print(f"\n  正余额 Key 排行榜:")
+        print(f"\n  Total positive balance: ${usd_pos:.2f} USD / ¥{cny_pos:.2f} CNY")
+        print(f"  Rate: 1 USD = {rate} CNY")
+        print(f"\n  Top positive-balance keys:")
         for i, r in enumerate(positive[:30]):
             cur = r.get("primary_currency", "USD")
             prov = r.get("provider", "?").upper()
@@ -371,10 +371,10 @@ def _print_summary(results, rate, providers=None):
             print(f"  {i+1:2d}. [{prov:10s}] {r['key_preview']} | {cur} {r['balance']:.4f} "
                   f"| ≈${r['balance_usd']:.2f} / ¥{r['balance_cny']:.2f} | {src}")
     else:
-        print(f"\n  无正余额 Key (所有有效 Key 余额 ≤ $0)")
+        print(f"\n  No positive-balance keys (all valid keys have balance <= $0)")
 
     if zero:
-        print(f"\n  零余额 Key ({len(zero)} 个) — 可能曾被使用或即将充值")
+        print(f"\n  Zero-balance keys ({len(zero)}) — may have been used or about to be topped up")
     print(f"{'='*60}")
 
 

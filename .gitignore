@@ -26,5 +26,12 @@ Thumbs.db
 # Claude
 .claude/
 
+# Local config — may contain tokens/proxies
+config.yaml
+
+# Tooling caches
+.pi-lens/
+
 # Temp scripts
 _*.py
+config.yaml

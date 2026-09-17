@@ -8,14 +8,15 @@ import hashlib
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 
-# Key pattern: sk- followed by 32-64 alphanumeric chars
-KEY_PATTERN = re.compile(r"sk-[a-zA-Z0-9]{32,64}")
+from detectors import GENERIC_TOKEN, looks_placeholder
+
+# Key pattern: all known provider prefixes (sk-*, gsk_*, hf_*, r8_*, ...)
+KEY_PATTERN = GENERIC_TOKEN
 
 BAD_PATTERNS = [
     "your", "xxx", "example", "placeholder", "replace", "here",
     "demo", "sample", "fake", "dummy", "changeme", "insert",
     "sk-xxxx", "sk-0000", "sk-1111", "sk-aaaa", "sk-bbbb",
-    "sk-proj-",
 ]
 
 # Paths that strongly indicate test/demo keys (low chance of balance)
@@ -55,10 +56,7 @@ def is_bad_key(key: str, extra_bad: list = None) -> bool:
     patterns = BAD_PATTERNS + (extra_bad or [])
     if any(b.lower() in lower for b in patterns):
         return True
-    body = key[3:]
-    if body.isdigit() or len(set(body)) < 4:
-        return True
-    return False
+    return looks_placeholder(key)
 
 
 def extract_keys(text: str, extra_bad: list = None) -> list[str]:
@@ -87,9 +85,7 @@ class BaseScanner(ABC):
         self.max_key_length = max_key_length
         self.extra_bad = extra_bad_patterns or []
         self._session = session
-        self.key_pattern = re.compile(
-            rf"sk-[a-zA-Z0-9]{{{min_key_length},{max_key_length}}}"
-        )
+        self.key_pattern = GENERIC_TOKEN
         self._stop_requested = False
         self._seen_urls = set()
         self.results: list[dict] = []

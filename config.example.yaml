@@ -1,0 +1,56 @@
+# ═══════════════════════════════════════════════════════════════════
+#  llmleaks — configuration
+#
+#  Precedence: CLI flag  >  this file  >  --profile preset  >  defaults
+#  CLI:  python cli.py --config config.yaml scan
+#  (config.yaml is loaded automatically when it exists next to cli.py)
+# ═══════════════════════════════════════════════════════════════════
+
+scan:
+  profile: standard          # quick|standard|max|deep|expanded|ultimate|marathon
+  sources: [github]          # list, or "all"; see `python cli.py sources`
+  providers: []              # empty = all known; e.g. [deepseek, openai, anthropic]
+  queries_file: null         # e.g. queries_v4.txt
+  skip_builtin: false        # ignore the built-in query library
+  extra_queries: []          # additional GitHub search queries
+  pages: null                # search result pages per query (100/page)
+  workers: null              # parallel search workers, one proxy/token each
+                           #   null = auto: min(#proxies or #tokens, 8)
+  duration: null             # max seconds (null = unlimited)
+  max_keys: null             # stop after N valid keys
+  loop: false                # repeat cycles until Ctrl+C (marathon)
+  min_balance: 0             # keep only keys with balance_usd >= this
+  min_key_length: 20
+  max_key_length: 120
+  exclude_repos: []          # fnmatch patterns, e.g. ["my-org/*"]
+
+network:
+  timeout: 15                # HTTP timeout, seconds
+  concurrency: null          # verify/fetch concurrency (null = profile)
+  search_delay: null         # seconds between queries (null = profile)
+  github_token: ""           # single token (gh CLI / GITHUB_TOKEN also work)
+  github_tokens: []          # token pool — one per worker ideally
+  github_tokens_file: null   # file with tokens, one per line
+  gitlab_token: ""
+  gitee_token: ""
+  proxies: []                # http:// or socks5:// — collection phase only
+  proxy_file: null           # file with proxies, one per line
+  vless: []                  # vless:// links — spawned via local sing-box
+  vless_file: null           # file with vless:// links
+  vless_base_port: 20800     # first local inbound port for VLESS
+  user_agent: null           # override research User-Agent
+
+verification:
+  with_balance: false        # probe billing endpoints (adds 1 GET per key)
+  store_raw: false           # write RAW keys to output files — off = hash only
+
+monitor:
+  poll_interval: 60          # seconds between GitHub Events polls
+  verify: true               # verify each key as it appears
+
+output:
+  dir: ./results
+  db: null                   # null = <dir>/findings.db
+  no_db: false               # disable SQLite storage entirely
+  usd_cny_rate: 7.25
+  quiet: false
