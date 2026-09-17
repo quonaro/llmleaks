@@ -19,6 +19,7 @@ scan:
   duration: null             # max seconds (null = unlimited)
   max_keys: null             # stop after N valid keys
   loop: false                # repeat cycles until Ctrl+C (marathon)
+  dry_run: false             # search only, no verify; saves .akh_progress.json
   min_balance: 0             # keep only keys with balance_usd >= this
   min_key_length: 20
   max_key_length: 120

@@ -2,7 +2,7 @@
 """
 llmleaks — unified CLI for finding leaked AI API keys.
 
-Subcommands:
+Commands:
   scan       Search sources for leaked keys, verify, store (replaces all
              *_scan.py scripts — old scripts are profiles now)
   verify     Verify keys from a file (txt / json / engine result file)
@@ -12,13 +12,18 @@ Subcommands:
   export     Export findings (hash + preview only, never raw keys)
   providers  List supported providers and detection patterns
   sources    List available scan sources
+
+All options can live in config.yaml (auto-loaded next to cli.py or via
+--config). Precedence: CLI flag > config.yaml > --profile > defaults.
 """
 
-import argparse
 import asyncio
 import os
 import sys
 import time
+from types import SimpleNamespace
+
+import click
 
 from scanner_engine import ScannerEngine, BUILTIN_QUERIES, DEFAULT_USD_CNY_RATE
 from detectors import PROVIDERS, provider_table, AMBIGUOUS_ORDER, GENERIC_TOKEN
@@ -57,11 +62,11 @@ PROFILES = {
 
 def log_func(msg, level="info"):
     if level == "warning":
-        print(f"[!] {msg}")
+        click.echo(f"[!] {msg}", err=True)
     elif level == "error":
-        print(f"[ERROR] {msg}")
+        click.echo(f"[ERROR] {msg}", err=True)
     else:
-        print(msg)
+        click.echo(msg)
 
 
 def _split_csv(s) -> list:
@@ -89,6 +94,7 @@ CFG_MAP = {
     "min_key_length":   ("scan.min_key_length", False),
     "max_key_length":   ("scan.max_key_length", False),
     "exclude_repo":     ("scan.exclude_repos", False),
+    "dry_run":          ("scan.dry_run", False),
     "concurrency":      ("network.concurrency", False),
     "search_delay":     ("network.search_delay", False),
     "timeout":          ("network.timeout", False),
@@ -125,18 +131,18 @@ def load_config(path: str | None) -> dict:
     if not path:
         return {}
     if not os.path.exists(path):
-        print(f"[ERROR] config not found: {path}")
-        sys.exit(1)
+        raise click.ClickException(f"config not found: {path}")
     import yaml
     with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     return cfg if isinstance(cfg, dict) else {}
 
 
-def _apply_config(args, cfg: dict):
-    """Fill args that are still None (not set on CLI) from config values."""
+def _apply_config(ns, cfg: dict):
+    """Fill params that are still unset (None / empty tuple) from config."""
     for attr, (path, join_csv) in CFG_MAP.items():
-        if not hasattr(args, attr) or getattr(args, attr) is not None:
+        cur = getattr(ns, attr, None)
+        if cur is not None and cur != () and cur != "":
             continue
         sec, key = path.split(".", 1)
         val = (cfg.get(sec) or {}).get(key)
@@ -144,179 +150,202 @@ def _apply_config(args, cfg: dict):
             continue
         if join_csv and isinstance(val, (list, tuple)):
             val = ",".join(str(x) for x in val)
-        setattr(args, attr, val)
+        setattr(ns, attr, val)
 
+
+def _params(ctx, kw) -> SimpleNamespace:
+    """click kwargs → namespace with config applied."""
+    ns = SimpleNamespace(**kw)
+    _apply_config(ns, ctx.obj["cfg"])
+    return ns
+
+
+# ──────────────────────────── shared helpers ────────────────────────────
 
 _VLESS_POOL = None  # keeps the sing-box subprocess alive for the process
 
 
-def _load_proxies(args) -> list:
+def _load_proxies(ns) -> list:
     global _VLESS_POOL
-    proxies = list(getattr(args, "proxy", None) or [])
-    pf = getattr(args, "proxy_file", None)
+    proxies = [p for p in (getattr(ns, "proxy", None) or []) if p]
+    pf = getattr(ns, "proxy_file", None)
     if pf and os.path.exists(pf):
         with open(pf, encoding="utf-8") as f:
             proxies += [ln.strip() for ln in f
                         if ln.strip() and not ln.startswith("#")]
 
     # VLESS links → local sing-box inbounds → http://127.0.0.1:* proxies
-    links = list(getattr(args, "vless", None) or [])
-    vf = getattr(args, "vless_file", None)
+    links = [v for v in (getattr(ns, "vless", None) or []) if v]
+    vf = getattr(ns, "vless_file", None)
     if vf and os.path.exists(vf):
         with open(vf, encoding="utf-8") as f:
             links += [ln.strip() for ln in f
                       if ln.strip() and not ln.startswith("#")]
     if links:
         from vless_pool import VlessPool
-        base_port = getattr(args, "vless_base_port", None) or 20800
+        base_port = getattr(ns, "vless_base_port", None) or 20800
         _VLESS_POOL = VlessPool(links, base_port=base_port)
         started = _VLESS_POOL.start()
-        print(f"vless: sing-box up, {len(started)} local proxies "
-              f"@{base_port}-{base_port + len(started) - 1}")
+        click.echo(f"vless: sing-box up, {len(started)} local proxies "
+                   f"@{base_port}-{base_port + len(started) - 1}")
         proxies += started
     return proxies
 
 
-def _load_tokens(args) -> list:
-    tokens = _split_csv(getattr(args, "github_tokens", "") or "")
-    tf = getattr(args, "github_tokens_file", None)
+def _load_tokens(ns) -> list:
+    tokens = _split_csv(getattr(ns, "github_tokens", None))
+    tf = getattr(ns, "github_tokens_file", None)
     if tf and os.path.exists(tf):
         with open(tf, encoding="utf-8") as f:
             tokens += [ln.strip() for ln in f
                        if ln.strip() and not ln.startswith("#")]
-    if getattr(args, "github_token", ""):
-        tokens.append(args.github_token)
+    if getattr(ns, "github_token", None):
+        tokens.append(ns.github_token)
     return tokens
 
 
-def build_engine(args) -> ScannerEngine:
-    providers = _split_csv(getattr(args, "providers", None)) or ALL_PROVIDERS
-    output_dir = getattr(args, "output_dir", None) or "./results"
-    db_path = getattr(args, "db", None) or os.path.join(output_dir,
-                                                       "findings.db")
+def build_engine(ns) -> ScannerEngine:
+    providers = _split_csv(getattr(ns, "providers", None)) or ALL_PROVIDERS
+    output_dir = getattr(ns, "output_dir", None) or "./results"
+    db_path = getattr(ns, "db", None) or os.path.join(output_dir,
+                                                      "findings.db")
     return ScannerEngine(
-        concurrency=getattr(args, "concurrency", None) or 15,
-        timeout=getattr(args, "timeout", None) or 15,
-        search_delay=getattr(args, "search_delay", None) or 4.0,
-        min_key_length=getattr(args, "min_key_length", None) or 20,
-        max_key_length=getattr(args, "max_key_length", None) or 120,
+        concurrency=getattr(ns, "concurrency", None) or 15,
+        timeout=getattr(ns, "timeout", None) or 15,
+        search_delay=getattr(ns, "search_delay", None)
+        or ScannerEngine.suggested_search_delay(),
+        min_key_length=getattr(ns, "min_key_length", None) or 20,
+        max_key_length=getattr(ns, "max_key_length", None) or 120,
         output_dir=output_dir,
         providers=providers,
-        usd_cny_rate=getattr(args, "usd_cny_rate", None)
+        usd_cny_rate=getattr(ns, "usd_cny_rate", None)
         or DEFAULT_USD_CNY_RATE,
-        exclude_repos=getattr(args, "exclude_repo", None) or [],
-        max_duration=getattr(args, "duration", None) or 0,
-        max_valid_keys=getattr(args, "max_keys", None) or 0,
-        scan_pages=getattr(args, "pages", None) or 3,
-        search_workers=getattr(args, "workers", None) or 0,
-        github_tokens=_load_tokens(args),
-        proxies=_load_proxies(args),
-        check_balance=bool(getattr(args, "with_balance", None)),
-        db_path=None if getattr(args, "no_db", None) else db_path,
-        store_raw_keys=bool(getattr(args, "store_raw", None)),
-        user_agent=getattr(args, "user_agent", None),
-        log_callback=log_func if not getattr(args, "quiet", None)
+        exclude_repos=list(getattr(ns, "exclude_repo", None) or []),
+        max_duration=getattr(ns, "duration", None) or 0,
+        max_valid_keys=getattr(ns, "max_keys", None) or 0,
+        scan_pages=getattr(ns, "pages", None) or 3,
+        search_workers=getattr(ns, "workers", None) or 0,
+        github_tokens=_load_tokens(ns),
+        proxies=_load_proxies(ns),
+        check_balance=bool(getattr(ns, "with_balance", None)),
+        db_path=None if getattr(ns, "no_db", None) else db_path,
+        store_raw_keys=bool(getattr(ns, "store_raw", None)),
+        user_agent=getattr(ns, "user_agent", None),
+        log_callback=log_func if not getattr(ns, "quiet", None)
         else (lambda m, l="info": None),
     )
 
 
-def _resolve_queries(args) -> list:
+def _resolve_queries(ns) -> list:
     queries = []
-    if not getattr(args, "skip_builtin", None):
+    if not getattr(ns, "skip_builtin", None):
         queries.extend(BUILTIN_QUERIES)
-    for q in getattr(args, "query", None) or []:
+    for q in getattr(ns, "query", None) or []:
         queries.append(q)
-    qf = getattr(args, "queries_file", None)
+    qf = getattr(ns, "queries_file", None)
     if qf and os.path.exists(qf):
         queries.extend(ScannerEngine.load_queries_file(qf))
     return queries or BUILTIN_QUERIES
 
 
-# ──────────────────────────── subcommands ────────────────────────────
+# ──────────────────────────── command logic ────────────────────────────
 
-def cmd_scan(args):
-    args.profile = args.profile or "standard"
-    prof = PROFILES.get(args.profile, PROFILES["standard"])
+def cmd_scan(ns):
+    ns.profile = ns.profile or "standard"
+    prof = PROFILES.get(ns.profile, PROFILES["standard"])
     # profile supplies defaults; config file and explicit flags win
     for k, v in prof.items():
         if k == "sources":
-            if not args.sources:
-                args.sources = v
+            if not ns.sources:
+                ns.sources = v
         elif k == "loop":
-            if args.loop is None:
-                args.loop = v
+            if ns.loop is None:
+                ns.loop = v
         else:
             attr = {"duration": "duration", "scan_pages": "pages",
                     "search_delay": "search_delay",
                     "concurrency": "concurrency"}[k]
-            if getattr(args, attr) is None:
-                setattr(args, attr, v)
+            if getattr(ns, attr) is None:
+                setattr(ns, attr, v)
 
-    queries = _resolve_queries(args)
-    sources = _split_csv(args.sources) or ["github"]
+    queries = _resolve_queries(ns)
+    sources = _split_csv(ns.sources) or ["github"]
     if sources == ["all"]:
         sources = ALL_SOURCES
 
-    engine = build_engine(args)
+    engine = build_engine(ns)
+
+    if ns.dry_run:
+        click.echo("--- dry run: search only, no verification ---")
+        all_keys = engine.scan_github(queries)
+        click.echo(f"\nfound {len(all_keys)} candidate keys (unverified)")
+        if all_keys:
+            engine.save_progress(all_keys)
+            click.echo(f"progress saved — verify later with: "
+                       f"cli.py verify {engine.output_dir}/.akh_progress.json")
+        return
+
     # workers: explicit flag/config, else #proxies, else #tokens, else seq
-    if args.workers is None:
+    if ns.workers is None:
         n = max(len(engine._proxy_pool._proxies), len(engine._gh_tokens), 1)
         engine.search_workers = min(n, 8)
     else:
-        engine.search_workers = args.workers
+        engine.search_workers = ns.workers
+
     authed = ScannerEngine.check_gh_auth()
-    print(f"llmleaks scan | profile={args.profile} sources={sources}")
-    print(f"queries={len(queries)} providers={engine.providers}")
-    print(f"concurrency={engine.concurrency} workers={engine.search_workers} "
-          f"pages={engine.scan_pages} delay={engine.search_delay}s "
-          f"duration={engine.max_duration or '∞'}s")
-    print(f"github_auth={'yes' if authed else 'NO (10 req/min!)'} "
-          f"tokens={len(engine._token_pool._tokens)} "
-          f"proxies={len(engine._proxy_pool._proxies)} "
-          f"balance_check={'ON' if engine.check_balance else 'off'} "
-          f"raw_keys_on_disk={'YES (--store-raw)' if engine.store_raw_keys else 'no'}")
+    click.echo(f"llmleaks scan | profile={ns.profile} sources={sources}")
+    click.echo(f"queries={len(queries)} providers={engine.providers}")
+    click.echo(f"concurrency={engine.concurrency} workers={engine.search_workers} "
+               f"pages={engine.scan_pages} delay={engine.search_delay}s "
+               f"duration={engine.max_duration or '∞'}s")
+    click.echo(f"github_auth={'yes' if authed else 'NO (10 req/min!)'} "
+               f"tokens={len(engine._token_pool._tokens)} "
+               f"proxies={len(engine._proxy_pool._proxies)} "
+               f"balance_check={'ON' if engine.check_balance else 'off'} "
+               f"raw_keys_on_disk={'YES (--store-raw)' if engine.store_raw_keys else 'no'}")
     if engine._store:
-        print(f"db={engine._store.path}")
-    print()
+        click.echo(f"db={engine._store.path}")
+    click.echo()
 
     merged = {}
     cycle = 0
     t0 = time.time()
     while True:
         cycle += 1
-        if args.loop:
-            print(f"===== cycle {cycle} =====")
+        if ns.loop:
+            click.echo(f"===== cycle {cycle} =====")
         try:
             if sources == ["github"]:
                 results = engine.run(queries)
             else:
-                pool_tokens = _load_tokens(args)
+                pool_tokens = _load_tokens(ns)
                 gh_tok = pool_tokens[0] if pool_tokens \
                     else ScannerEngine.get_gh_token()
                 results = engine.run_multi_source(
                     sources, queries=queries,
                     github_token=gh_tok or "",
-                    gitlab_token=args.gitlab_token or "",
-                    gitee_token=args.gitee_token or "")
+                    gitlab_token=ns.gitlab_token or "",
+                    gitee_token=ns.gitee_token or "")
         except KeyboardInterrupt:
-            print("\n[!] interrupted — results saved")
+            click.echo("\n[!] interrupted — results saved")
             break
         for r in results:
             merged[r["key"]] = r
-        if not args.loop:
+        if not ns.loop:
             break
         time.sleep(5)
 
     results = list(merged.values())
-    if args.min_balance:
-        results = [r for r in results if r.get("balance_usd", 0) >= args.min_balance]
+    if ns.min_balance:
+        results = [r for r in results
+                   if r.get("balance_usd", 0) >= ns.min_balance]
     engine._save_final(results)
     _print_summary(results)
-    print(f"\ntotal time: {time.time()-t0:.0f}s")
+    click.echo(f"\ntotal time: {time.time()-t0:.0f}s")
 
 
-def cmd_verify(args):
-    path = args.file
+def cmd_verify(ns):
+    path = ns.file
     keys = {}
     if path.endswith(".json"):
         keys = ScannerEngine.load_keys_from_file(path)
@@ -331,8 +360,8 @@ def cmd_verify(args):
                     keys[k] = {"key": k,
                                "key_preview": k[:10] + "..." + k[-4:],
                                "repos": []}
-    print(f"verifying {len(keys)} keys from {path}")
-    engine = build_engine(args)
+    click.echo(f"verifying {len(keys)} keys from {path}")
+    engine = build_engine(ns)
     # rank provider candidates per key — avoids probing all 15 providers
     for k, info in keys.items():
         if not info.get("providers"):
@@ -343,13 +372,13 @@ def cmd_verify(args):
     _print_summary(results)
 
 
-def cmd_monitor(args):
+def cmd_monitor(ns):
     from scanners.github_events import EventsMonitor
-    engine = build_engine(args)
+    engine = build_engine(ns)
 
     def on_key(k, repo, fpath, url):
-        print(f"  [KEY] {k[:10]}...{k[-4:]} | {repo}/{fpath}")
-        if args.verify:
+        click.echo(f"  [KEY] {k[:10]}...{k[-4:]} | {repo}/{fpath}")
+        if ns.verify:
             providers, _ = engine._detector.classify(
                 k, context=f"{repo} {fpath}")
             res = engine._verify_dict({k: {
@@ -360,226 +389,301 @@ def cmd_monitor(args):
             engine._save_incremental([r for r in res if r.get("valid")], 0, 1)
 
     async def run():
-        m = EventsMonitor(token=args.github_token or "",
-                          poll_interval=args.poll_interval or 60,
-                          concurrency=args.concurrency or 15,
-                          timeout=args.timeout or 15,
+        m = EventsMonitor(token=ns.github_token or "",
+                          poll_interval=ns.poll_interval or 60,
+                          concurrency=ns.concurrency or 15,
+                          timeout=ns.timeout or 15,
                           max_events_per_poll=30)
         m.on_key_found = on_key
         await m.search()
 
-    print("monitoring GitHub PushEvents (Ctrl+C to stop)…")
+    click.echo("monitoring GitHub PushEvents (Ctrl+C to stop)…")
     try:
         asyncio.run(run())
     except KeyboardInterrupt:
-        print("stopped")
+        click.echo("stopped")
 
 
-def _open_store(args) -> Store:
-    db = getattr(args, "db", None) or os.path.join(
-        getattr(args, "output_dir", None) or "./results", "findings.db")
+def _open_store(ns) -> Store:
+    db = getattr(ns, "db", None) or os.path.join(
+        getattr(ns, "output_dir", None) or "./results", "findings.db")
     if not os.path.exists(db):
-        print(f"[ERROR] no DB at {db} — run a scan first")
-        sys.exit(1)
+        raise click.ClickException(f"no DB at {db} — run a scan first")
     return Store(db)
 
 
-def cmd_stats(args):
-    s = _open_store(args).stats()
-    print(f"scans:            {s['scans']}")
-    print(f"total findings:   {s['total_findings']}")
+def cmd_stats(ns):
+    s = _open_store(ns).stats()
+    click.echo(f"scans:            {s['scans']}")
+    click.echo(f"total findings:   {s['total_findings']}")
     for st, n in sorted(s["by_status"].items(), key=lambda x: -x[1]):
-        print(f"  status={st:<14} {n}")
-    print(f"valid by provider:")
+        click.echo(f"  status={st:<14} {n}")
+    click.echo("valid by provider:")
     for p, n in sorted(s["valid_by_provider"].items(), key=lambda x: -x[1]):
-        print(f"  {p:<14} {n}")
-    print(f"unique by source:")
+        click.echo(f"  {p:<14} {n}")
+    click.echo("unique by source:")
     for src, n in sorted(s["unique_by_source"].items(), key=lambda x: -x[1]):
-        print(f"  {src or '?':<14} {n}")
-    print(f"total balance (valid): ${s['total_balance_usd']:.2f}")
+        click.echo(f"  {src or '?':<14} {n}")
+    click.echo(f"total balance (valid): ${s['total_balance_usd']:.2f}")
 
 
-def cmd_report(args):
-    store = _open_store(args)
-    out = args.out or os.path.join(os.path.dirname(store.path),
-                                   "research_report.md")
+def cmd_report(ns):
+    store = _open_store(ns)
+    out = ns.out or os.path.join(os.path.dirname(store.path),
+                                 "research_report.md")
     store.report_markdown(out)
-    print(f"report → {out}")
+    click.echo(f"report → {out}")
 
 
-def cmd_export(args):
-    store = _open_store(args)
-    out = args.out or os.path.join(
-        os.path.dirname(store.path), f"findings.{args.format}")
-    if args.format == "csv":
-        store.export_csv(out, status=args.status)
+def cmd_export(ns):
+    store = _open_store(ns)
+    out = ns.out or os.path.join(
+        os.path.dirname(store.path), f"findings.{ns.format}")
+    if ns.format == "csv":
+        store.export_csv(out, status=ns.status)
     else:
-        store.export_json(out, status=args.status)
-    print(f"exported → {out} (hash+preview only, no raw keys)")
+        store.export_json(out, status=ns.status)
+    click.echo(f"exported → {out} (hash+preview only, no raw keys)")
 
 
-def cmd_providers(args):
-    print(provider_table())
-    print("\nambiguous sk- fallback order:", ", ".join(AMBIGUOUS_ORDER))
+def cmd_providers(ns):
+    click.echo(provider_table())
+    click.echo("\nambiguous sk- fallback order: " + ", ".join(AMBIGUOUS_ORDER))
 
 
-def cmd_sources(args):
-    print("available sources:")
+def cmd_sources(ns):
+    click.echo("available sources:")
     for s in ALL_SOURCES:
-        print(f"  {s}")
-    print("\nprofiles:")
+        click.echo(f"  {s}")
+    click.echo("\nprofiles:")
     for name, p in PROFILES.items():
-        print(f"  {name:<10} {p}")
+        click.echo(f"  {name:<10} {p}")
 
 
-# ──────────────────────────── argparse ────────────────────────────
-# Every optional arg defaults to None = "unset" so config.yaml and
-# profiles can fill it in. Precedence: CLI flag > config.yaml > profile.
+# ──────────────────────────── click wiring ────────────────────────────
+# Every option defaults to None = "unset" so config.yaml and profiles can
+# fill it in. Booleans use --flag/--no-flag pairs.
 
-_BOOL = argparse.BooleanOptionalAction
-
-
-def _add_common(p):
-    p.add_argument("-c", "--concurrency", type=int, default=None,
-                   help="verify/fetch concurrency")
-    p.add_argument("--timeout", type=int, default=None)
-    p.add_argument("--output-dir", default=None)
-    p.add_argument("--db", default=None,
-                   help="findings DB path (default: <output-dir>/findings.db)")
-    p.add_argument("--no-db", action="store_true", default=None,
-                   help="don't write SQLite (config: output.no_db)")
-    p.add_argument("--providers", default=None,
-                   help="comma list; default = all known providers")
-    p.add_argument("--with-balance", action=_BOOL, default=None,
-                   help="probe billing endpoints (default: off)")
-    p.add_argument("--store-raw", action=_BOOL, default=None,
-                   help="write raw keys to output files (default: hash only)")
-    p.add_argument("-q", "--quiet", action=_BOOL, default=None)
+CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"],
+                    "max_content_width": 110}
 
 
-def _add_network(p):
-    p.add_argument("--github-token", default=None)
-    p.add_argument("--github-tokens", default=None,
-                   help="comma-separated extra GitHub tokens (pool)")
-    p.add_argument("--github-tokens-file", default=None)
-    p.add_argument("--gitlab-token", default=None)
-    p.add_argument("--gitee-token", default=None)
-    p.add_argument("--proxy", action="append", default=None,
-                   help="collection-phase proxy (repeatable); "
-                        "NEVER used for provider verification")
-    p.add_argument("--proxy-file", default=None)
-    p.add_argument("--vless", action="append", default=None,
-                   help="vless:// link (repeatable) — spawned via sing-box")
-    p.add_argument("--vless-file", default=None,
-                   help="file with vless:// links, one per line")
-    p.add_argument("--vless-base-port", type=int, default=None,
-                   help="first local inbound port for VLESS rotation")
-    p.add_argument("--user-agent", default=None)
+def common_options(f):
+    opts = [
+        click.option("-c", "--concurrency", type=int, default=None,
+                     help="verify/fetch concurrency"),
+        click.option("--timeout", type=int, default=None,
+                     help="HTTP timeout, seconds"),
+        click.option("--output-dir", type=click.Path(), default=None,
+                     help="output directory"),
+        click.option("--db", type=click.Path(), default=None,
+                     help="findings DB path (default: <output-dir>/findings.db)"),
+        click.option("--no-db", is_flag=True, flag_value=True, default=None,
+                     help="don't write SQLite (config: output.no_db)"),
+        click.option("--providers", default=None,
+                     help="comma list; default = all known providers"),
+        click.option("--with-balance/--no-with-balance", default=None,
+                     help="probe billing endpoints (default: off)"),
+        click.option("--store-raw/--no-store-raw", default=None,
+                     help="write raw keys to output files (default: hash only)"),
+        click.option("-q", "--quiet/--no-quiet", default=None,
+                     help="suppress engine output"),
+    ]
+    for o in opts:
+        f = o(f)
+    return f
 
 
-def build_parser():
-    p = argparse.ArgumentParser(
-        prog="llmleaks",
-        description="llmleaks — leaked AI API key research scanner",
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config", default=None,
-                   help="config.yaml path (auto-detected next to cli.py)")
-    sub = p.add_subparsers(dest="cmd", required=True)
+def network_options(f):
+    opts = [
+        click.option("--github-token", default=None,
+                     help="GitHub token (gh CLI / GITHUB_TOKEN also work)"),
+        click.option("--github-tokens", default=None,
+                     help="comma-separated extra GitHub tokens (pool)"),
+        click.option("--github-tokens-file", type=click.Path(), default=None,
+                     help="file with tokens, one per line"),
+        click.option("--gitlab-token", default=None),
+        click.option("--gitee-token", default=None),
+        click.option("--proxy", multiple=True, default=None,
+                     help="collection-phase proxy (repeatable); "
+                          "NEVER used for provider verification"),
+        click.option("--proxy-file", type=click.Path(), default=None,
+                     help="file with proxies, one per line"),
+        click.option("--vless", multiple=True, default=None,
+                     help="vless:// link (repeatable) — spawned via sing-box"),
+        click.option("--vless-file", type=click.Path(), default=None,
+                     help="file with vless:// links, one per line"),
+        click.option("--vless-base-port", type=int, default=None,
+                     help="first local inbound port for VLESS rotation"),
+        click.option("--user-agent", default=None,
+                     help="override research User-Agent"),
+    ]
+    for o in opts:
+        f = o(f)
+    return f
 
-    s = sub.add_parser("scan", help="search + verify pipeline")
-    s.add_argument("--profile", choices=list(PROFILES), default=None,
-                   help="preset (replaces old *_scan.py scripts)")
-    s.add_argument("--sources", default=None,
-                   help="comma list or 'all' (default: github)")
-    s.add_argument("--query", action="append", default=None,
-                   help="extra search query")
-    s.add_argument("--queries-file", default=None)
-    s.add_argument("--skip-builtin", action=_BOOL, default=None)
-    s.add_argument("--duration", type=int, default=None,
-                   help="max seconds (0=unlimited)")
-    s.add_argument("--workers", type=int, default=None,
-                   help="parallel search workers — each on its own "
-                        "proxy/token (default: #proxies or #tokens, max 8)")
-    s.add_argument("--max-keys", type=int, default=None)
-    s.add_argument("--pages", type=int, default=None,
-                   help="search pages/query")
-    s.add_argument("--search-delay", type=float, default=None)
-    s.add_argument("--min-balance", type=float, default=None)
-    s.add_argument("--exclude-repo", action="append", default=None)
-    s.add_argument("--usd-cny-rate", type=float, default=None)
-    s.add_argument("--min-key-length", type=int, default=None)
-    s.add_argument("--max-key-length", type=int, default=None)
-    s.add_argument("--loop", action=_BOOL, default=None,
-                   help="repeat cycles until Ctrl+C (marathon)")
-    _add_common(s); _add_network(s)
-    s.set_defaults(func=cmd_scan)
 
-    v = sub.add_parser("verify", help="verify keys from file")
-    v.add_argument("file", help="txt (one per line) or engine json")
-    _add_common(v); _add_network(v)
-    v.set_defaults(func=cmd_verify)
+@click.group(context_settings=CONTEXT_SETTINGS,
+             epilog="Docs: USAGE.md · Config: config.yaml (auto-loaded)")
+@click.option("--config", type=click.Path(), default=None,
+              help="config.yaml path (auto-detected next to cli.py)")
+@click.version_option("2.0", prog_name="llmleaks")
+@click.pass_context
+def cli(ctx, config):
+    """llmleaks — leaked AI API key research scanner."""
+    ctx.ensure_object(dict)
+    ctx.obj["cfg"] = load_config(config)
 
-    m = sub.add_parser("monitor", help="real-time GitHub events monitor")
-    m.add_argument("--poll-interval", type=int, default=None)
-    m.add_argument("--verify", action=_BOOL, default=None,
-                   help="verify each key as it appears")
-    m.add_argument("--duration", type=int, default=None)
-    m.add_argument("--pages", type=int, default=None)
-    m.add_argument("--search-delay", type=float, default=None)
-    m.add_argument("--max-keys", type=int, default=None)
-    _add_common(m); _add_network(m)
-    m.set_defaults(func=cmd_monitor)
 
-    for name, fn in [("stats", cmd_stats), ("report", cmd_report),
-                     ("export", cmd_export)]:
-        sp = sub.add_parser(name)
-        sp.add_argument("--db", default=None)
-        sp.add_argument("--output-dir", default=None)
-        if name == "report":
-            sp.add_argument("--out", default=None)
-        if name == "export":
-            sp.add_argument("--format", choices=["csv", "json"],
-                            default="csv")
-            sp.add_argument("--status", default=None,
-                            help="filter: valid|revoked|no_quota|…")
-            sp.add_argument("--out", default=None)
-        sp.set_defaults(func=fn)
+@cli.command(epilog="""
+\b
+Examples:
+  llmleaks scan --profile quick
+  llmleaks scan --sources github,gist,issues --workers 5
+  llmleaks scan --vless-file vless.txt --github-tokens-file tokens.txt
+  llmleaks scan --query "openai sk- filename:env" --no-skip-builtin
+""")
+@click.option("--profile", type=click.Choice(list(PROFILES)), default=None,
+              help="preset (replaces old *_scan.py scripts)")
+@click.option("--sources", default=None,
+              help="comma list or 'all' (default: github)")
+@click.option("--query", multiple=True, default=None,
+              help="extra search query (repeatable)")
+@click.option("--queries-file", type=click.Path(exists=True), default=None,
+              help="file with queries, one per line")
+@click.option("--skip-builtin/--no-skip-builtin", default=None,
+              help="ignore the built-in query library")
+@click.option("--duration", type=int, default=None,
+              help="max seconds (0=unlimited)")
+@click.option("--workers", type=int, default=None,
+              help="parallel search workers, one proxy/token each "
+                   "(default: #proxies or #tokens, max 8)")
+@click.option("--max-keys", type=int, default=None,
+              help="stop after N valid keys")
+@click.option("--pages", type=int, default=None,
+              help="search result pages per query (100/page)")
+@click.option("--search-delay", type=float, default=None,
+              help="seconds between queries")
+@click.option("--min-balance", type=float, default=None,
+              help="keep only keys with balance_usd >= N")
+@click.option("--exclude-repo", multiple=True, default=None,
+              help="fnmatch repo pattern to exclude (repeatable)")
+@click.option("--usd-cny-rate", type=float, default=None,
+              help="USD/CNY exchange rate")
+@click.option("--min-key-length", type=int, default=None)
+@click.option("--max-key-length", type=int, default=None)
+@click.option("--loop/--no-loop", default=None,
+              help="repeat cycles until Ctrl+C (marathon)")
+@click.option("--dry-run/--no-dry-run", default=None,
+              help="search only, no verify; saves .akh_progress.json")
+@common_options
+@network_options
+@click.pass_context
+def scan(ctx, **kw):
+    """Search + verify + store pipeline."""
+    cmd_scan(_params(ctx, kw))
 
-    sub.add_parser("providers").set_defaults(func=cmd_providers)
-    sub.add_parser("sources").set_defaults(func=cmd_sources)
-    return p
+
+@cli.command()
+@click.argument("file", type=click.Path(exists=True))
+@common_options
+@network_options
+@click.pass_context
+def verify(ctx, **kw):
+    """Verify keys from a txt/json file."""
+    cmd_verify(_params(ctx, kw))
+
+
+@cli.command()
+@click.option("--poll-interval", type=int, default=None,
+              help="seconds between GitHub Events polls")
+@click.option("--verify/--no-verify", default=None,
+              help="verify each key as it appears")
+@click.option("--duration", type=int, default=None)
+@click.option("--pages", type=int, default=None)
+@click.option("--search-delay", type=float, default=None)
+@click.option("--max-keys", type=int, default=None)
+@common_options
+@network_options
+@click.pass_context
+def monitor(ctx, **kw):
+    """Real-time GitHub PushEvent monitor."""
+    cmd_monitor(_params(ctx, kw))
+
+
+@cli.command()
+@click.option("--db", type=click.Path(), default=None)
+@click.option("--output-dir", type=click.Path(), default=None)
+@click.pass_context
+def stats(ctx, **kw):
+    """Show findings DB statistics."""
+    cmd_stats(_params(ctx, kw))
+
+
+@cli.command()
+@click.option("--db", type=click.Path(), default=None)
+@click.option("--output-dir", type=click.Path(), default=None)
+@click.option("--out", type=click.Path(), default=None,
+              help="output file (default: <db dir>/research_report.md)")
+@click.pass_context
+def report(ctx, **kw):
+    """Generate markdown research report from DB."""
+    cmd_report(_params(ctx, kw))
+
+
+@cli.command()
+@click.option("--db", type=click.Path(), default=None)
+@click.option("--output-dir", type=click.Path(), default=None)
+@click.option("--format", "format",
+              type=click.Choice(["csv", "json"]), default="csv",
+              show_default=True)
+@click.option("--status", default=None,
+              help="filter: valid|revoked|no_quota|…")
+@click.option("--out", type=click.Path(), default=None)
+@click.pass_context
+def export(ctx, **kw):
+    """Export findings (hash + preview only, never raw keys)."""
+    cmd_export(_params(ctx, kw))
+
+
+@cli.command()
+@click.pass_context
+def providers(ctx):
+    """List supported providers and detection patterns."""
+    cmd_providers(None)
+
+
+@cli.command()
+@click.pass_context
+def sources(ctx):
+    """List available scan sources and profiles."""
+    cmd_sources(None)
 
 
 def _print_summary(results):
     valid = [r for r in results if r.get("valid")]
     by_status = {}
     for r in results:
-        by_status[r.get("status") or ("valid" if r.get("valid") else "?")] = \
-            by_status.get(r.get("status") or ("valid" if r.get("valid") else "?"), 0) + 1
-    print(f"\n{'='*56}\n  summary\n{'='*56}")
-    print(f"  verified: {len(results)}  valid: {len(valid)}")
+        st = r.get("status") or ("valid" if r.get("valid") else "?")
+        by_status[st] = by_status.get(st, 0) + 1
+    click.echo(f"\n{'='*56}\n  summary\n{'='*56}")
+    click.echo(f"  verified: {len(results)}  valid: {len(valid)}")
     for st, n in sorted(by_status.items(), key=lambda x: -x[1]):
-        print(f"    {st:<14} {n}")
+        click.echo(f"    {st:<14} {n}")
     by_prov = {}
     for r in valid:
-        by_prov[r.get("provider", "?")] = by_prov.get(r.get("provider", "?"), 0) + 1
+        by_prov[r.get("provider", "?")] = \
+            by_prov.get(r.get("provider", "?"), 0) + 1
     if by_prov:
-        print("  valid by provider:")
+        click.echo("  valid by provider:")
         for p_, n in sorted(by_prov.items(), key=lambda x: -x[1]):
-            print(f"    {p_:<14} {n}")
+            click.echo(f"    {p_:<14} {n}")
     pos = [r for r in valid if r.get("balance_usd", 0) > 0]
     if pos:
-        print(f"  positive-balance keys: {len(pos)}  "
-              f"total ${sum(r['balance_usd'] for r in pos):.2f}")
-    print("=" * 56)
-
-
-def main():
-    args = build_parser().parse_args()
-    cfg = load_config(getattr(args, "config", None))
-    _apply_config(args, cfg)
-    args.func(args)
+        click.echo(f"  positive-balance keys: {len(pos)}  "
+                   f"total ${sum(r['balance_usd'] for r in pos):.2f}")
+    click.echo("=" * 56)
 
 
 if __name__ == "__main__":
-    main()
+    cli()

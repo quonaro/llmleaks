@@ -2,8 +2,9 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python" alt="Python">
-  <img src="https://img.shields.io/badge/Scanners-14-green?style=flat-square" alt="Scanners">
-  <img src="https://img.shields.io/badge/Queries-238-red?style=flat-square" alt="Queries">
+  <img src="https://img.shields.io/badge/Sources-13-green?style=flat-square" alt="Sources">
+  <img src="https://img.shields.io/badge/Queries-369-red?style=flat-square" alt="Queries">
+  <img src="https://img.shields.io/badge/Providers-15-orange?style=flat-square" alt="Providers">
   <img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="License">
 </p>
 
@@ -18,7 +19,7 @@
 
 ---
 
-> A tool that scans 14 platforms with 238 search patterns to find exposed AI provider API keys (OpenAI, DeepSeek, Anthropic, and a dozen more), validates them, and checks their balance. Built because we were shocked by how many live keys with big balances are sitting in public repos, completely unnoticed.
+> A tool that scans 13 platforms with 369 built-in search patterns to find exposed AI provider API keys (OpenAI, DeepSeek, Anthropic, and a dozen more), validates them with a single read-only request, and stores only hashes. Built because we were shocked by how many live keys with big balances are sitting in public repos, completely unnoticed.
 
 ---
 
@@ -42,7 +43,7 @@ We built this tool to answer a simple question: **how many AI provider keys are 
 
 ## 🎯 What It Does
 
-Automatically scans **14 platforms** with **238 search patterns** to find publicly exposed AI provider API keys, then **validates** each one and **checks the balance**.
+Automatically scans **13 platforms** with **369 built-in search patterns** to find publicly exposed AI provider API keys across **15 providers**, then **validates** each candidate with one read-only GET and records the verdict (balance probing is opt-in).
 
 ### Scanning Sources
 
@@ -65,26 +66,50 @@ Automatically scans **14 platforms** with **238 search patterns** to find public
 ## 🚀 Quick Start
 
 ```bash
-pip install aiohttp requests
+pip install aiohttp requests click pyyaml
 
 # Optional: authenticate GitHub CLI for higher rate limits
 gh auth login
 
-# Unified CLI (all scan scripts are now --profile presets)
+# Single entry point: cli.py (click-based)
 python cli.py scan --profile quick      # ~15 min
 python cli.py scan --profile ultimate   # full multi-source scan
 python cli.py scan --sources all --providers openai,anthropic,deepseek
-python cli.py verify keys.txt           # verify a key list
+python cli.py scan --dry-run            # search only, no verify
+python cli.py verify keys.txt           # verify a key list / checkpoint
 python cli.py monitor --verify          # real-time leak monitor
 python cli.py stats && python cli.py report
 ```
+
+### Configuration
+
+Everything is configurable in **`config.yaml`** (auto-loaded next to
+`cli.py`, or `--config path.yaml`; see `config.example.yaml`). Tokens and
+VLESS links belong there — the file is gitignored.
+
+Precedence: **CLI flag > config.yaml > --profile > defaults**. Every
+boolean accepts `--flag`/`--no-flag` so any config value can be
+overridden from the CLI in either direction.
+
+```yaml
+scan:        profile, sources, providers, pages, workers, duration,
+             max_keys, loop, dry_run, min_balance, exclude_repos, ...
+network:     github_token(s), gitlab/gitee tokens, proxies, vless(_file),
+             vless_base_port, timeout, concurrency, search_delay, ...
+verification: with_balance, store_raw
+output:      dir, db, no_db, usd_cny_rate, quiet
+```
+
+Parallel batched search: `--workers N` runs N queries at once, each
+worker pinned to its own proxy + GitHub token. With `--vless-file`
+one worker per VLESS exit is the intended setup (requires `sing-box`).
 
 Findings land in `results/findings.db` (SQLite) — **raw keys are never
 written to disk** (sha256 + preview only; `--store-raw` opts out).
 Balance probing is off by default; `--with-balance` enables it.
 See [USAGE.md](USAGE.md) for the full reference.
 
-### Scan Profiles (formerly separate scripts)
+### Scan Profiles
 
 | Profile | Description | Duration |
 |---------|-------------|----------|
@@ -118,12 +143,15 @@ results = engine.run(BUILTIN_QUERIES)
 
 ```
 llmleaks/
-├── cli.py                   # Unified CLI (scan/verify/monitor/stats/report)
+├── cli.py                   # Unified CLI (click): scan/verify/monitor/stats/report/export
+├── config.yaml              # All settings (gitignored — tokens live here)
+├── config.example.yaml      # Documented config template
 ├── scanner_engine.py        # Core engine (search + verify + save)
 ├── detectors.py             # Per-provider key patterns + context ranking
 ├── verifiers.py             # Minimal-touch verification (1 GET/provider)
 ├── store.py                 # SQLite findings DB (hash-only, no raw keys)
 ├── ratelimit.py             # TokenPool / DomainLimiter / ProxyPool
+├── vless_pool.py            # VLESS → local proxies via sing-box
 ├── scanners/
 │   ├── base.py              # Base scanner class
 │   ├── github_gist.py       # GitHub Gist scanner
@@ -139,11 +167,9 @@ llmleaks/
 │   ├── docker.py            # Docker Hub scanner
 │   ├── commoncrawl.py       # Common Crawl scanner
 │   └── wayback.py           # Wayback Machine scanner
-├── *_scan.py                # Legacy scan scripts (use cli.py instead)
-├── queries_v4.txt           # Query library (238 patterns)
+├── queries_v4.txt           # Extra query library (191 patterns)
 ├── results/                 # Scan output directory
-├── README.md                # This file (English)
-├── README_CN.md             # Chinese version
+├── README.md                # This file
 ├── USAGE.md                 # Detailed usage guide
 └── LICENSE                  # MIT License
 ```

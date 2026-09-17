@@ -1463,7 +1463,7 @@ class ScannerEngine:
         csv_path = os.path.join(self.output_dir, "api_keys_result.csv")
         try:
             with open(csv_path, "w", encoding="utf-8", newline="") as f:
-                f.write("Key预览,Key标识,提供商,有效,原始余额,币种,USD等值,CNY等值,仓库名,文件名,文件路径,仓库链接,验证时间\n")
+                f.write("KeyPreview,KeyID,Provider,Valid,RawBalance,Currency,USDEquiv,CNYEquiv,Repo,FileName,FilePath,RepoURL,VerifiedAt\n")
                 for r in sorted_r:
                     er = self._exportable(r)
                     key_id = er.get("key") or er.get("key_hash", "")
@@ -1711,7 +1711,7 @@ class ScannerEngine:
 
         if stopped_early:
             elapsed = time.time() - self._start_time
-            self.log(f"扫描提前终止: {self._stop_reason()} ({elapsed:.0f}s), 已收集 {len(all_keys)} 个 Key", "warning")
+            self.log(f"Scan stopped early: {self._stop_reason()} ({elapsed:.0f}s), collected {len(all_keys)} keys", "warning")
         return all_keys
 
     # ---- Async Verification (Multi-Provider) ----
@@ -1895,13 +1895,13 @@ class ScannerEngine:
 
                 return entry
 
-            # 分批处理：首批不检查超时（确保至少验证一批）
+            # Process in batches: don't check the timeout for the first batch (ensure at least one batch is verified)
             batch_size = self.concurrency
             first_batch = True
             for start in range(0, len(keys_list), batch_size):
                 if not first_batch and (self._should_stop() or batch_stop[0]):
                     unprocessed = len(keys_list) - start
-                    self.log(f"验证已停止: {self._stop_reason()}，跳过剩余 {unprocessed} 个 Key")
+                    self.log(f"Verification stopped: {self._stop_reason()}, skipping remaining {unprocessed} keys")
                     break
                 first_batch = False
                 batch = keys_list[start:start + batch_size]
@@ -1911,36 +1911,36 @@ class ScannerEngine:
         return results
 
     def verify_keys(self, all_keys: dict) -> list:
-        self.log(f"开始验证 {len(all_keys)} 个 Key (并发 {self.concurrency})...")
+        self.log(f"Verifying {len(all_keys)} keys (concurrency {self.concurrency})...")
         self.progress_callback(0, len(all_keys), "verify")
         t0 = time.time()
         results = asyncio.run(self._verify_all_async(all_keys))
-        self.log(f"验证完成: {time.time()-t0:.1f}s")
+        self.log(f"Verification done: {time.time()-t0:.1f}s")
         return results
 
-    # ---- 结果处理 ----
+    # ---- Result handling ----
 
     def sort_results(self, results: list) -> list:
         results.sort(key=lambda x: x.get("balance_usd", 0), reverse=True)
         return results
 
     def _safe_write(self, path: str, write_func, retries: int = 5) -> bool:
-        """安全写文件，处理文件被锁的情况"""
+        """Safe file write, handles the file being locked"""
         for attempt in range(retries):
             try:
                 write_func(path)
                 return True
             except PermissionError:
                 if attempt < retries - 1:
-                    # 带时间戳的备用文件名
+                    # Fallback filename with a timestamp
                     base, ext = os.path.splitext(path)
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                     path = f"{base}_{ts}{ext}"
                 else:
-                    self.log(f"保存失败(文件被锁定): {path}", "warning")
+                    self.log(f"Save failed (file locked): {path}", "warning")
                     return False
             except Exception as e:
-                self.log(f"保存失败: {e}", "error")
+                self.log(f"Save failed: {e}", "error")
                 return False
         return False
 
@@ -1964,7 +1964,7 @@ class ScannerEngine:
 
             def _write(p):
                 with open(p, "w", encoding="utf-8") as f:
-                    f.write("Key预览,Key标识,提供商,有效,原始余额,币种,USD等值,CNY等值,仓库名,文件名,文件路径,仓库链接,验证时间\n")
+                    f.write("KeyPreview,KeyID,Provider,Valid,RawBalance,Currency,USDEquiv,CNYEquiv,Repo,FileName,FilePath,RepoURL,VerifiedAt\n")
                     for r in results:
                         er = self._exportable(r)
                         key_id = er.get("key") or er.get("key_hash", "")
@@ -2011,7 +2011,7 @@ class ScannerEngine:
 
         return results
 
-    # ---- 进度管理 ----
+    # ---- Progress management ----
 
     def save_progress(self, all_keys: dict, path: str = None):
         path = path or os.path.join(self.output_dir, ".akh_progress.json")

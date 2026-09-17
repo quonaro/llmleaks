@@ -3,23 +3,37 @@
 ## Setup
 
 ```bash
-pip install aiohttp requests   # Python 3.10+, no other dependencies
+pip install aiohttp requests click pyyaml   # Python 3.10+
 
 # GitHub auth (30 req/min vs 10 req/min unauthenticated):
 gh auth login
 # or: export GITHUB_TOKEN="ghp_..."  / extra pool tokens below
+
+# Optional, only for VLESS proxy rotation:
+#   sing-box must be in PATH (https://sing-box.sagernet.org)
 ```
 
 ## CLI
 
-Everything is one entry point now. The old `*_scan.py` scripts still work
-but are superseded by `scan --profile`.
+Single entry point: `cli.py` (click-based, `-h`/`--help` everywhere).
+
+```
+python cli.py scan       search + verify + store
+python cli.py verify     verify keys from a file / checkpoint
+python cli.py monitor    real-time GitHub PushEvent monitor
+python cli.py stats      findings DB statistics
+python cli.py report     markdown research report from DB
+python cli.py export     CSV/JSON export (hash + preview only)
+python cli.py providers  list providers & detection patterns
+python cli.py sources    list sources & profiles
+```
 
 ## Configuration
 
 All settings live in `config.yaml` (auto-loaded when it sits next to
-`cli.py`, or `--config path/to.yaml`). It's gitignored — tokens belong
-here, not in git.
+`cli.py`, or `--config path/to.yaml`). Copy `config.example.yaml` as a
+starting point. `config.yaml` is gitignored — tokens belong here,
+not in git.
 
 Precedence: **CLI flag > config.yaml > --profile preset > built-in
 defaults**. Every CLI flag has a config key; sections mirror the help
@@ -28,7 +42,7 @@ groups:
 ```yaml
 scan:       profile, sources, providers, queries_file, skip_builtin,
             extra_queries, pages, workers, duration, max_keys, loop,
-            min_balance, exclude_repos, min/max_key_length
+            dry_run, min_balance, exclude_repos, min/max_key_length
 network:    timeout, concurrency, search_delay, github_token(s),
             gitlab_token, gitee_token, proxies, proxy_file,
             vless, vless_file, vless_base_port, user_agent
@@ -38,39 +52,39 @@ output:     dir, db, no_db, usd_cny_rate, quiet
 ```
 
 Every boolean flag accepts its negation (`--with-balance` /
-`--no-with-balance`, `--loop` / `--no-loop`, ...) so config values can be
-overridden in either direction from the CLI.
+`--no-with-balance`, `--loop` / `--no-loop`, `--dry-run` /
+`--no-dry-run`, ...) so config values can be overridden in either
+direction from the CLI. Keep several configs for different modes and
+switch with `--config`:
 
-```
-python cli.py scan       search + verify + store
-python cli.py verify     verify keys from a file
-python cli.py monitor    real-time GitHub PushEvent monitor
-python cli.py stats      findings DB statistics
-python cli.py report     markdown research report from DB
-python cli.py export     CSV/JSON export (hash + preview only)
-python cli.py providers  list providers & detection patterns
-python cli.py sources    list sources & profiles
+```bash
+python cli.py --config marathon.yaml scan
+python cli.py --config stealth.yaml scan --duration 600   # flag wins
 ```
 
 ## Scanning
 
 ```bash
-# Profiles = old scripts
-python cli.py scan --profile quick      # ~15 min   (was quick_batch.py)
-python cli.py scan --profile standard   # ~1 h      (was full_scan.py)
-python cli.py scan --profile max        # ~2 h      (was max_scan.py)
-python cli.py scan --profile deep       # ~3 h      (was deep_scan.py)
-python cli.py scan --profile expanded   # multi-source (was expanded_scan.py)
-python cli.py scan --profile ultimate   # everything  (was ultimate_scan.py)
+# Profiles (presets replacing the old *_scan.py scripts)
+python cli.py scan --profile quick      # ~15 min
+python cli.py scan --profile standard   # ~1 h
+python cli.py scan --profile max        # ~2 h
+python cli.py scan --profile deep       # ~3 h
+python cli.py scan --profile expanded   # multi-source
+python cli.py scan --profile ultimate   # everything
 python cli.py scan --profile marathon   # cycles until Ctrl+C
 
-# Manual control (flags override profile values)
+# Manual control (flags override profile and config values)
 python cli.py scan --sources github,gist,issues,gitlab
 python cli.py scan --sources all
 python cli.py scan --query "openai sk- filename:env" --skip-builtin
 python cli.py scan --queries-file queries_v4.txt --pages 5 -c 20
 python cli.py scan --providers deepseek,openai,anthropic
 python cli.py scan --duration 3600 --max-keys 100 --loop
+
+# Dry run: search only, no verification — saves .akh_progress.json
+# (verify it later with `cli.py verify results/.akh_progress.json`)
+python cli.py scan --dry-run --profile quick
 ```
 
 ### Providers
@@ -169,10 +183,11 @@ Statuses: `valid`, `revoked`, `no_quota` (works but out of credit),
 
 ## Legacy scripts
 
-`quick_batch.py`, `max_scan.py`, `deep_scan.py`, `ultimate_scan.py`,
-`expanded_scan.py`, `marathon_scan.py`, `six_hour_scan.py`,
-`full_scan.py`, `deepseek_key_scanner.py`, `api_key_hunter.py`
-remain for compatibility — prefer `cli.py`.
+Removed. Their functionality maps to:
+`scan --profile quick|standard|max|deep|expanded|ultimate|marathon`,
+`scan --dry-run` (was `--dry-run`), `verify <file>` (was
+`--verify-only`, accepts `.akh_progress.json` checkpoints too),
+`monitor` (was `--monitor`).
 
 ## Security notes
 
